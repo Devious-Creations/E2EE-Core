@@ -1,0 +1,38 @@
+{
+  "name": "e2ee-core",
+  "version": "0.1.0",
+  "description": "The end-to-end-encryption core of a production mobile app: key hierarchy, X25519 pairing + SAS, a relay double-ratchet, per-relationship shared keys, and authenticated sealing. Published for public review.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "exports": {
+    ".": "./src/index.js",
+    "./adapters": "./adapters/index.js"
+  },
+  "files": [
+    "src",
+    "adapters",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "demo": "node examples/demo.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.2.0",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1"
+  },
+  "keywords": [
+    "e2ee",
+    "end-to-end-encryption",
+    "cryptography",
+    "double-ratchet",
+    "x25519",
+    "nacl",
+    "audit"
+  ]
+}
