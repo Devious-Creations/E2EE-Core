@@ -76,3 +76,33 @@ test('loadDynamicKeys rehydrates K_shared from the own grant after a local shred
   await accepter.shredDynamicLocal(DYN);
   assert.equal(await accepter.loadDynamicKeys('dyn-mismatch', ownGrant), null);
 });
+
+test('onUnwrapFault observes a failed own-grant unwrap (and null is still returned)', async () => {
+  const vault = await memberWithDEK();
+  const faults = [];
+  const dyn = createDynamicKeys(vault, { onUnwrapFault: (err) => faults.push(err) });
+
+  const kPair = await P.encodeBase64(await P.randomBytes(32));
+  const DYN = 'dyn-fault';
+  const { ownGrant } = await dyn.provisionDynamic(DYN, kPair);
+
+  // Fresh slot + a DIFFERENT master DEK → the own grant no longer unwraps.
+  await vault.cryptoShredDynamic(DYN);
+  await vault.storeDEK(await P.encodeBase64(await V.generateDEK()));
+
+  assert.equal(await dyn.loadDynamicKeys(DYN, ownGrant), null);
+  assert.equal(faults.length, 1);
+  assert.ok(faults[0] instanceof Error);
+
+  // A missing grant is NOT a fault — nothing to unwrap, nothing to observe.
+  assert.equal(await dyn.loadDynamicKeys('dyn-absent'), null);
+  assert.equal(faults.length, 1);
+
+  // A throwing observer must never break the load path.
+  const explosive = createDynamicKeys(vault, {
+    onUnwrapFault: () => {
+      throw new Error('observer bug');
+    },
+  });
+  assert.equal(await explosive.loadDynamicKeys(DYN, ownGrant), null);
+});

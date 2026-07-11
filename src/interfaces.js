@@ -38,6 +38,10 @@
  * @property {(event: string, handler: (payload: object) => void) => void} on  Subscribe
  *   to inbound messages of `event`.
  * @property {() => Promise<void>|void} close  Tear the channel down.
+ * @property {(handler: (message?: string) => void) => void} [onError]  OPTIONAL:
+ *   register a handler for fatal connection loss. A transport that can detect
+ *   it (e.g. a Realtime channel's error status) should call the handler so an
+ *   in-flight handshake fails immediately instead of waiting out its timeout.
  */
 
 export {};

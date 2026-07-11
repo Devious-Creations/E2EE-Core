@@ -43,8 +43,13 @@ async function unwrapSharedKey(dynamicId, wrappedB64, nonceB64, wrapKeyB64) {
 /**
  * Bind the provisioning flow to a keyVault (which owns the injected KeyStore).
  * @param {ReturnType<import('./keyVault.js').createKeyVault>} keyVault
+ * @param {{ onUnwrapFault?: (err: Error) => void }} [opts] - onUnwrapFault is
+ *   called when an own-grant unwrap fails during loadDynamicKeys (wrong key,
+ *   tampered, or bound to a different dynamic). That failure silently makes the
+ *   whole shared plane un-decryptable, so a consumer will usually want to
+ *   surface it (telemetry lives in the consumer, never here).
  */
-export function createDynamicKeys(keyVault) {
+export function createDynamicKeys(keyVault, { onUnwrapFault } = {}) {
   /**
    * Creator side. Generates K_shared and returns the at-rest own grant (wrapped
    * under this member's master DEK) plus the one-time delivery (sealed under
@@ -116,8 +121,14 @@ export function createDynamicKeys(keyVault) {
     let kSharedB64;
     try {
       kSharedB64 = await unwrapSharedKey(dynamicId, wrapped, nonce, dekB64);
-    } catch {
-      return null; // wrong key, tampered, or bound to a different dynamic
+    } catch (err) {
+      // wrong key, tampered, or bound to a different dynamic
+      try {
+        onUnwrapFault?.(err);
+      } catch {
+        /* the observer must never break the load path */
+      }
+      return null;
     }
     await keyVault.storeDynamicSharedKey(dynamicId, kSharedB64);
     return kSharedB64;

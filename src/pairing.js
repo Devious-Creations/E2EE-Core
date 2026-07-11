@@ -111,7 +111,8 @@ export function buildRelayChannelName(userId1, userId2) {
  * Build a pairing controller bound to a KeyStore (persists the pairing root
  * key) and a Transport (carries the public handshake messages to the OTHER
  * party). Both seams are injected — this module imports neither expo-secure-store
- * nor Supabase.
+ * nor Supabase. The Transport may be omitted for a controller that only manages
+ * stored pairings (a handshake attempt without one throws).
  *
  * The Transport is expected to already be scoped to the pairing code (in the app
  * a `supabase.channel('pairing:<code>')`); the crypto core does not build channel
@@ -124,9 +125,9 @@ export function createPairing({ keyStore, transport } = {}) {
   if (!keyStore || typeof keyStore.getItem !== 'function') {
     throw new Error('[pairing] createPairing requires a KeyStore { getItem, setItem, removeItem }');
   }
-  if (!transport || typeof transport.send !== 'function' || typeof transport.on !== 'function') {
-    throw new Error('[pairing] createPairing requires a Transport { send, on, close }');
-  }
+  // The transport is only needed to run a handshake — a controller built just to
+  // manage stored pairings (list/rotate/remove/clear) may omit it. The check
+  // lives in performHandshake.
 
   // SecureStore seam → KeyStore. Same key strings as the app.
   const secureGet = (key) => keyStore.getItem(key);
@@ -173,6 +174,9 @@ export function createPairing({ keyStore, transport } = {}) {
   }
 
   async function performHandshake(code, userId, role, onStateChange) {
+    if (!transport || typeof transport.send !== 'function' || typeof transport.on !== 'function') {
+      throw new Error('[pairing] a handshake requires a Transport { send, on, close }');
+    }
     cancelActiveHandshake();
 
     // Only the joiner jumps straight to 'exchanging'. The initiator stays in
@@ -443,18 +447,22 @@ export function createPairing({ keyStore, transport } = {}) {
         succeed();
       });
 
-      // The app started broadcasting only once the Realtime channel reported
-      // SUBSCRIBED; the injected Transport has no subscribe lifecycle (the caller
-      // hands us a live channel), so the initiator starts its commit loop now.
-      // Broadcast the commitment immediately, then every 2s until a partner
-      // responds — covers transport delivery races. The joiner waits for a
-      // commit (repeated by the initiator).
-      //
-      // TODO(transport): the app also failed the handshake on CHANNEL_ERROR /
-      // TIMED_OUT from the Realtime subscribe callback. The injected Transport
-      // exposes no connection status, so that branch is dropped; a production
-      // Transport should surface fatal connection loss (e.g. by rejecting via a
-      // separate signal) rather than silently letting the 120s timeout fire.
+      // A Transport that can detect fatal connection loss surfaces it through
+      // the optional onError seam — the handshake then fails immediately
+      // instead of letting the full timeout fire (the app's Realtime channel
+      // reports CHANNEL_ERROR / TIMED_OUT through this).
+      if (typeof transport.onError === 'function') {
+        transport.onError((message) =>
+          fail(typeof message === 'string' && message ? message : 'Pairing channel error'),
+        );
+      }
+
+      // The caller hands us a LIVE transport (the app awaits the Realtime
+      // channel's SUBSCRIBED status before starting the handshake), so the
+      // initiator starts its commit loop now. Broadcast the commitment
+      // immediately, then every 2s until a partner responds — covers transport
+      // delivery races. The joiner waits for a commit (repeated by the
+      // initiator).
       if (role === 'initiator') {
         startRepeat(() => send('pair_commit', { commit: myCommit }));
       }

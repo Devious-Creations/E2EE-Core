@@ -155,7 +155,33 @@ test('generatePairingCode: WORD-NNNN shape from the known word list', async () =
   }
 });
 
-test('createPairing: rejects missing seams', () => {
+test('createPairing: rejects a missing KeyStore; a Transport is only needed to handshake', async () => {
   assert.throws(() => createPairing({ transport: createMemoryTransportPair()[0] }), /KeyStore/);
-  assert.throws(() => createPairing({ keyStore: createMemoryKeyStore() }), /Transport/);
+
+  // Store-only controller: no transport, stored-pairing management still works…
+  const storeOnly = createPairing({ keyStore: createMemoryKeyStore() });
+  assert.deepEqual(await storeOnly.getStoredPairings(), []);
+  const id = await storeOnly.storePairing('partner-1', 'a-root-key', 'relay:a:b');
+  assert.equal(await storeOnly.getSharedKey(id), 'a-root-key');
+
+  // …but attempting a handshake without a transport throws.
+  await assert.rejects(() => storeOnly.initiatePairing('WOLF-0001', 'user-1', () => {}), /Transport/);
+});
+
+test('transport.onError fails an in-flight handshake immediately', async () => {
+  const [tA] = createMemoryTransportPair();
+  let fireError;
+  tA.onError = (handler) => {
+    fireError = handler;
+  };
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
+
+  // No partner ever answers; the error signal must reject long before the
+  // 120s handshake timeout.
+  const attempt = A.initiatePairing('WOLF-0002', 'user-a', () => {});
+  const rejected = assert.rejects(() => attempt, /channel died/);
+  // Give the handshake a beat to register the onError handler.
+  await new Promise((r) => setTimeout(r, 20));
+  fireError('channel died');
+  await rejected;
 });
