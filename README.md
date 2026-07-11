@@ -189,13 +189,11 @@ it is exactly the kind of decision an audit should challenge.
 
 ## Reporting a finding
 
-Please **do not** open a public issue for a suspected vulnerability. Email
-`<SECURITY-CONTACT — TODO: fill in>` with details and we'll coordinate disclosure.
-Non-sensitive feedback (docs, style, test ideas) is very welcome as normal issues
-/ PRs.
+Please **do not** open a public issue for a suspected vulnerability. Use GitHub's
+private vulnerability reporting instead: **Security → Report a vulnerability** on
+this repository. We'll coordinate disclosure there. Non-sensitive feedback (docs,
+style, test ideas) is very welcome as normal issues / PRs.
 
 ## License
 
-**TODO — choose a license before publishing** (a permissive one such as
-Apache-2.0 or MIT is typical for an audit target). Add a `LICENSE` file and
-update the `license` field in `package.json`.
+[Apache-2.0](./LICENSE).
