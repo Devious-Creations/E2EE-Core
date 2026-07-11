@@ -31,3 +31,39 @@ test('sealBytes/openBytes round-trips a raw blob and rejects tampering', async (
   const tamperedB64 = await P.encodeBase64(tampered);
   await assert.rejects(() => S.openBytes(tamperedB64, key));
 });
+
+test('sealBox/openSealBox round-trips to a recipient public key', async () => {
+  const recipient = await P.generateKeypair();
+  const recipientPubB64 = await P.encodeBase64(recipient.publicKey);
+  const recipientSecB64 = await P.encodeBase64(recipient.secretKey);
+  const plain = await P.encodeUTF8('sealed to a stranger — 世界');
+
+  const sealed = await S.sealBox(plain, recipientPubB64);
+  assert.equal(typeof sealed.ephPub, 'string');
+  assert.equal(typeof sealed.nonce, 'string');
+  assert.equal(typeof sealed.ciphertext, 'string');
+
+  const opened = await S.openSealBox(sealed, recipientSecB64);
+  assert.equal(await P.decodeUTF8(opened), 'sealed to a stranger — 世界');
+
+  // Each seal uses a fresh ephemeral key: sealing the same plaintext twice
+  // must not repeat the ephemeral public key or the ciphertext.
+  const sealed2 = await S.sealBox(plain, recipientPubB64);
+  assert.notEqual(sealed2.ephPub, sealed.ephPub);
+  assert.notEqual(sealed2.ciphertext, sealed.ciphertext);
+});
+
+test('openSealBox rejects the wrong recipient and tampered ciphertext', async () => {
+  const recipient = await P.generateKeypair();
+  const other = await P.generateKeypair();
+  const sealed = await S.sealBox(await P.encodeUTF8('secret'), await P.encodeBase64(recipient.publicKey));
+  const otherSecB64 = await P.encodeBase64(other.secretKey);
+  const recipientSecB64 = await P.encodeBase64(recipient.secretKey);
+
+  await assert.rejects(() => S.openSealBox(sealed, otherSecB64));
+
+  const cipherBytes = await P.decodeBase64(sealed.ciphertext);
+  cipherBytes[0] ^= 0x01;
+  const tampered = { ...sealed, ciphertext: await P.encodeBase64(cipherBytes) };
+  await assert.rejects(() => S.openSealBox(tampered, recipientSecB64));
+});

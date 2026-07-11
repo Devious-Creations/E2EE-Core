@@ -87,3 +87,45 @@ export async function openBytes(sealedB64, keyB64) {
   const dataBytes = await primitives.decryptSecretbox(ciphertext, nonce, keyBytes);
   return primitives.encodeBase64(dataBytes);
 }
+
+// ── Sealed box to a public key (no prior relationship, anonymous sender) ──
+
+/**
+ * Seal bytes to a recipient's published X25519 public key with no prior
+ * relationship: ephemeral keypair → X25519 shared key → secretbox. The
+ * ephemeral public key travels with the ciphertext (tweetnacl has no
+ * crypto_box_seal; this is the equivalent construction with an explicit
+ * random nonce). NOTE: sealed boxes carry no sender authentication — a
+ * receiver must treat open failures as expected input, and any identity
+ * claims must be bound INSIDE the sealed payload by the caller.
+ * @param {Uint8Array} plainBytes
+ * @param {string} recipientPublicKeyB64 - recipient's published public key
+ * @returns {Promise<{ ephPub: string, nonce: string, ciphertext: string }>} base64
+ */
+export async function sealBox(plainBytes, recipientPublicKeyB64) {
+  const recipientPub = await primitives.decodeBase64(recipientPublicKeyB64);
+  const eph = await primitives.generateKeypair();
+  const sharedKey = await primitives.deriveSharedKey(recipientPub, eph.secretKey);
+  const { nonce, ciphertext } = await primitives.encryptSecretbox(plainBytes, sharedKey);
+  return {
+    ephPub: await primitives.encodeBase64(eph.publicKey),
+    nonce: await primitives.encodeBase64(nonce),
+    ciphertext: await primitives.encodeBase64(ciphertext),
+  };
+}
+
+/**
+ * Open a sealed box with the recipient's identity secret key.
+ * @param {{ ephPub: string, nonce: string, ciphertext: string }} sealed - base64 triple
+ * @param {string} mySecretKeyB64 - recipient's X25519 secret key
+ * @returns {Promise<Uint8Array>} plaintext bytes
+ * @throws {Error} if opening fails (wrong recipient or tampered)
+ */
+export async function openSealBox(sealed, mySecretKeyB64) {
+  const ephPub = await primitives.decodeBase64(sealed.ephPub);
+  const mySecret = await primitives.decodeBase64(mySecretKeyB64);
+  const sharedKey = await primitives.deriveSharedKey(ephPub, mySecret);
+  const cipherBytes = await primitives.decodeBase64(sealed.ciphertext);
+  const nonceBytes = await primitives.decodeBase64(sealed.nonce);
+  return primitives.decryptSecretbox(cipherBytes, nonceBytes, sharedKey);
+}
