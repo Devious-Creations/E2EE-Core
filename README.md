@@ -1,10 +1,14 @@
 # e2ee-core — an end-to-end-encryption core
 
+[![tests](https://github.com/Devious-Creations/E2EE-Core/actions/workflows/test.yml/badge.svg)](https://github.com/Devious-Creations/E2EE-Core/actions/workflows/test.yml)
+
 > **Status: pre-audit. We are publishing this to invite review.** Please break it.
 > See [Reporting a finding](#reporting-a-finding). This is the *actual* crypto
-> that ships in a production mobile app, extracted verbatim — only the platform
-> seams (device keychain, network transport) were swapped for injectable
-> interfaces so the whole thing runs with zero platform dependencies.
+> that ships in a production mobile app — not a copy: **the app depends on this
+> repository directly**, as a commit-pinned package dependency, so the code you
+> review is the code that runs. Only the platform seams (device keychain,
+> network transport) are injectable interfaces, which is why the whole thing
+> also runs here with zero platform dependencies.
 
 This is the encryption core of an end-to-end-encrypted mobile app: the servers store user data, relationship
 ("dynamic") data, proof images, and relayed messages **only as ciphertext**. The
@@ -96,7 +100,7 @@ in one process (that is exactly what the tests do).
 | --- | --- |
 | [`primitives.js`](./src/primitives.js) | The thin, platform-agnostic wrapper over the audited libraries. Everything else is built from this. |
 | [`keyVault.js`](./src/keyVault.js) | DEK generation, scrypt/PBKDF2 KEK derivation, DEK wrap/unwrap, recovery codes, and per-relationship key storage (via `KeyStore`). |
-| [`sealing.js`](./src/sealing.js) | Authenticated encryption of a JSON object or a raw blob under a 32-byte key (the backup and proof-image sealing). Pure. |
+| [`sealing.js`](./src/sealing.js) | Authenticated encryption of a JSON object or a raw blob under a 32-byte key (the backup and proof-image sealing), plus sealed boxes to a published X25519 public key. Pure. |
 | [`dynamicKeys.js`](./src/dynamicKeys.js) | Provisioning K_shared between two paired members, **with AAD binding** (see below). |
 | [`pairing.js`](./src/pairing.js) | The interactive X25519 handshake + SAS that produces K_pair, over an untrusted `Transport`. |
 | [`ratchet.js`](./src/ratchet.js) | The symmetric-key message ratchet over K_pair: HMAC chain keys, per-message keys, skipped-key handling, replay rejection. |
@@ -113,6 +117,17 @@ blob whose bound `d` differs — otherwise a malicious server could swap a grant
 between two of a user's dynamics (both are under the same DEK, so a naive swap
 would unwrap cleanly). This "AAD in the plaintext" construction is one of the
 things we'd most like a second opinion on.
+
+### Sealed boxes (to a public key)
+
+`sealing.sealBox` seals bytes to a recipient's *published* X25519 public key
+with no prior relationship: ephemeral keypair → X25519 shared key → `secretbox`,
+with the ephemeral public key travelling alongside the ciphertext. tweetnacl has
+no `crypto_box_seal`; this is the equivalent construction with an explicit
+random nonce instead of a nonce derived from the two public keys. **Sealed
+boxes carry no sender authentication** — a receiver must treat open failures as
+expected input, and any identity claim must be bound *inside* the sealed
+payload by the caller.
 
 ### Pairing (X25519 + SAS)
 
@@ -134,6 +149,13 @@ not a full Double Ratchet with per-message Diffie-Hellman — so it does **not**
 provide post-compromise security (a compromised chain state stays compromised
 until re-pairing). We think that's an acceptable trade for this app's model, but
 it is exactly the kind of decision an audit should challenge.
+
+A purge/unpair replaces surviving chain state with a fingerprinted **tombstone**:
+the ratchet then refuses to re-derive chains for the *same* root key, so a stale
+in-memory copy of the root cannot silently resurrect a "destroyed" chain and
+decrypt a still-archived history (cryptographic erasure). A genuine re-pair
+rotates the root — a different fingerprint — and initializes fresh chains
+normally.
 
 ---
 
@@ -164,6 +186,8 @@ it is exactly the kind of decision an audit should challenge.
   backup. This is inherent to a password-recoverable backup.
 - **The transport's availability/ordering.** The ratchet tolerates reordering and
   gaps but does not itself guarantee delivery.
+- **Sealed-box sender authenticity.** A sealed box proves nothing about who sent
+  it; callers must bind any identity claim inside the authenticated payload.
 
 ---
 
@@ -182,8 +206,14 @@ it is exactly the kind of decision an audit should challenge.
    phone? Are the recovery-code entropy (~60 bits) and PBKDF2-10k defensible?
 5. **Nonce hygiene** — every `secretbox` nonce is a fresh 24 random bytes; is
    there any path where a nonce could be reused under a fixed key?
-6. **The extraction itself** — did we change any security-relevant behaviour
-   while lifting this out of the app? Diff against the app's source is welcome.
+6. **The sealed-box construction** — `sealBox` is `crypto_box_seal` rebuilt from
+   `box.before` + `secretbox` with an explicit random nonce (tweetnacl lacks the
+   primitive). Is it a faithful equivalent, and is the no-sender-authentication
+   caveat stated strongly enough for how such a construction tends to get used?
+7. **The consumer seams** — `KeyStore` and `Transport` are injected. Can a
+   *conforming but adversarial* implementation of either (a transport that lies,
+   drops, or replays; a key store that reorders or loses writes) break any
+   guarantee the threat model claims?
 
 ---
 
