@@ -195,11 +195,27 @@ export function createRatchet(keyStore) {
 
   // Load the chain state; (re)initialize when absent or when the pairing key
   // changed (re-pair with the same partner rotates the root → fresh chains).
+  //
+  // A purge destroys chain state via clearRatchetState (writing a tombstone,
+  // below), but a stale in-memory copy of the pairing key elsewhere in the
+  // application can still call ratchetEncrypt/Decrypt for this channel.
+  // Silently re-deriving fresh chains from that SAME pairing key would
+  // resurrect a "destroyed" chain that can decrypt the partner's still
+  // server-side archive, breaking cryptographic erasure. Refuse instead — a
+  // genuine re-pair rotates the root key (a different fingerprint), which
+  // still reinitializes normally below.
   async function loadState(session) {
     const { sharedKey, channelName, selfId } = session;
     const stored = await readState(selfId, channelName);
     const fp = await fingerprint(sharedKey);
-    if (stored && stored.fp === fp) return stored;
+    if (stored && stored.fp === fp) {
+      if (stored.tombstoned) {
+        throw new Error(
+          '[ratchet] chain state was destroyed by a purge/unpair — refusing to re-derive it for the same pairing key',
+        );
+      }
+      return stored;
+    }
     return initState(sharedKey, channelName, selfId);
   }
 
@@ -315,16 +331,32 @@ export function createRatchet(keyStore) {
   }
 
   /**
-   * Wipe the chain state for a channel (unpair / sign-out).
+   * Wipe the chain state for a channel (unpair / sign-out / purge).
    * The channel name carries both participant ids and only one has state on
-   * this device — both candidate slots are deleted so callers don't need to
+   * this device — both candidate slots are cleared so callers don't need to
    * know which side they are.
+   *
+   * A slot that held real state is replaced with a fingerprinted tombstone
+   * rather than bare-deleted, so loadState can refuse to silently re-derive
+   * (and re-persist) chains for the SAME pairing key afterwards. A slot with
+   * no state is just deleted — there is nothing to guard against.
    * @param {string} channelName
    */
   async function clearRatchetState(channelName) {
     const parts = String(channelName).split(':');
     for (const id of parts.slice(1)) {
-      await deleteState(id, channelName);
+      let fp = null;
+      try {
+        const existing = await readState(id, channelName);
+        fp = existing?.fp ?? null;
+      } catch {
+        // Unreadable/corrupt — nothing to tombstone, fall through to delete.
+      }
+      if (fp) {
+        await writeState(id, channelName, { tombstoned: true, fp });
+      } else {
+        await deleteState(id, channelName);
+      }
     }
   }
 

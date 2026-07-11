@@ -148,7 +148,7 @@ test('persistence: chain state survives a fresh createRatchet on the same KeySto
   assert.deepEqual(await bobReborn.ratchetDecrypt(w2, bobSession), { n: 2 });
 });
 
-test('clearRatchetState wipes both participant slots for a channel', async () => {
+test('clearRatchetState tombstones a purged chain — same pairing key is refused', async () => {
   const { aliceSession, bobSession, channelName } = await pairing();
   const store = createMemoryKeyStore();
   const alice = createRatchet(store);
@@ -157,13 +157,45 @@ test('clearRatchetState wipes both participant slots for a channel', async () =>
   const w0 = await alice.ratchetEncrypt({ n: 0 }, aliceSession);
   await bob.ratchetDecrypt(w0, bobSession);
 
-  // Wipe via a fresh instance so it must read/delete from the KeyStore itself.
+  // Wipe via a fresh instance so it must read/clear from the KeyStore itself.
   const janitor = createRatchet(store);
   await janitor.clearRatchetState(channelName);
 
-  // After a wipe, both directions reinitialize from scratch: sender restarts
-  // at ctr 0.
+  // A destroyed chain must NOT silently re-derive from the same pairing key —
+  // that would resurrect a chain that can decrypt the partner's archive and
+  // break cryptographic erasure. Both directions refuse.
   const aliceReborn = createRatchet(store);
-  const wFresh = await aliceReborn.ratchetEncrypt({ n: 'restart' }, aliceSession);
+  await assert.rejects(
+    () => aliceReborn.ratchetEncrypt({ n: 'resurrect' }, aliceSession),
+    /destroyed by a purge\/unpair/,
+  );
+  const bobReborn = createRatchet(store);
+  await assert.rejects(() => bobReborn.ratchetDecrypt(w0, bobSession), /destroyed by a purge\/unpair/);
+});
+
+test('a genuine re-pair (rotated root key) reinitializes past a tombstone', async () => {
+  const { aliceSession, channelName } = await pairing();
+  const store = createMemoryKeyStore();
+  const alice = createRatchet(store);
+
+  await alice.ratchetEncrypt({ n: 0 }, aliceSession);
+  await alice.clearRatchetState(channelName);
+
+  // Re-pair rotates K_pair → different fingerprint → fresh chains at ctr 0.
+  const rotatedKey = await P.encodeBase64(await P.randomBytes(32));
+  const rotatedSession = { ...aliceSession, sharedKey: rotatedKey };
+  const wFresh = await alice.ratchetEncrypt({ n: 'restart' }, rotatedSession);
   assert.equal(wFresh.ctr, 0);
+});
+
+test('clearRatchetState on a channel with no state leaves nothing behind', async () => {
+  const { aliceSession, channelName } = await pairing();
+  const store = createMemoryKeyStore();
+  const janitor = createRatchet(store);
+
+  // Nothing stored → slots are simply deleted, no tombstone; the same pairing
+  // key still initializes normally afterwards.
+  await janitor.clearRatchetState(channelName);
+  const w = await createRatchet(store).ratchetEncrypt({ n: 0 }, aliceSession);
+  assert.equal(w.ctr, 0);
 });
