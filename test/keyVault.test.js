@@ -32,6 +32,17 @@ test('recovery codes recover the DEK; a wrong code is rejected', async () => {
   await assert.rejects(() => V.unwrapWithRecoveryCode('ZZZZ-ZZZZ-ZZZZ', entries), /Invalid recovery code/);
 });
 
+test('buildRecoveryEntries: same code built twice yields different hash values (salt feeds the hash)', async () => {
+  const dek = await V.generateDEK();
+  const code = (await V.generateRecoveryCodes(1))[0];
+
+  const [entry1] = await V.buildRecoveryEntries(dek, [code]);
+  const [entry2] = await V.buildRecoveryEntries(dek, [code]);
+
+  // Salts are random, so hashes must differ (collision probability ≈ 2^-256).
+  assert.notEqual(entry1.hash, entry2.hash);
+});
+
 test('createKeyVault: DEK persistence + wrap-to-master round-trips', async () => {
   const vault = V.createKeyVault(createMemoryKeyStore());
   assert.equal(await vault.loadDEK(), null);
