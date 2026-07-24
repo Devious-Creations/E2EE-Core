@@ -1,6 +1,6 @@
 {
   "name": "e2ee-core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The end-to-end-encryption core of a production mobile app: key hierarchy, X25519 pairing + SAS, a relay double-ratchet, per-relationship shared keys, and authenticated sealing. Published for public review.",
   "type": "module",
   "license": "Apache-2.0",

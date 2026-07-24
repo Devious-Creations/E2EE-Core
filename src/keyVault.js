@@ -109,10 +109,21 @@ export async function generateRecoveryCodes(count = RECOVERY_CODE_COUNT) {
   return codes;
 }
 
-/** SHA-256 hash a recovery code for lookup (not security — the code is the secret). */
-async function hashCode(code) {
+/**
+ * SHA-256 hash a recovery code for lookup, salted with the per-entry KDF salt
+ * (which is public anyway) to prevent cross-user precomputation.
+ * Input: saltBytes || utf8(normalizedCode).
+ * Format change from v0.1: previously unsalted.
+ * @param {string} code - raw recovery code (dashes or not)
+ * @param {Uint8Array} saltBytes - 32-byte per-entry salt
+ */
+async function hashCode(code, saltBytes) {
   const normalized = code.replace(/-/g, '').toUpperCase();
-  const hash = await primitives.sha256Bytes(new TextEncoder().encode(normalized));
+  const encoded = new TextEncoder().encode(normalized);
+  const input = new Uint8Array(saltBytes.length + encoded.length);
+  input.set(saltBytes, 0);
+  input.set(encoded, saltBytes.length);
+  const hash = await primitives.sha256Bytes(input);
   return primitives.encodeBase64(hash);
 }
 
@@ -128,7 +139,8 @@ export async function buildRecoveryEntries(dek, codes) {
     // Recovery codes use the cheap KDF on purpose — ~60 bits of entropy needs no stretching.
     const recoveryKEK = await deriveKEK(normalized, salt, KDF_PBKDF2_LEGACY);
     const { wrappedDek, nonce } = await wrapDEK(dek, recoveryKEK);
-    entries.push({ hash: await hashCode(code), wrappedDek, nonce, salt: await primitives.encodeBase64(salt) });
+    // hash uses the raw salt bytes (before base64 encoding) — must match unwrapWithRecoveryCode.
+    entries.push({ hash: await hashCode(code, salt), wrappedDek, nonce, salt: await primitives.encodeBase64(salt) });
   }
   return entries;
 }
@@ -139,10 +151,10 @@ export async function buildRecoveryEntries(dek, codes) {
  * @throws {Error} if no matching entry found
  */
 export async function unwrapWithRecoveryCode(code, entries) {
-  const codeHash = await hashCode(code);
   for (let i = 0; i < entries.length; i++) {
+    const salt = await primitives.decodeBase64(entries[i].salt);
+    const codeHash = await hashCode(code, salt);
     if (entries[i].hash === codeHash) {
-      const salt = await primitives.decodeBase64(entries[i].salt);
       const normalized = code.replace(/-/g, '').toUpperCase();
       const recoveryKEK = await deriveKEK(normalized, salt, KDF_PBKDF2_LEGACY);
       const dek = await unwrapDEK(entries[i].wrappedDek, entries[i].nonce, recoveryKEK);
