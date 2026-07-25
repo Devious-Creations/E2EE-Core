@@ -143,15 +143,17 @@ test('clearPairing + removePairing wipe the stored root key', async () => {
   assert.deepEqual(await A.getStoredPairings(), []);
 });
 
-test('generatePairingCode: WORD-NNNN shape from the known word list', async () => {
+test('generatePairingCode: WORD-WORD-NNNN shape from the known word list', async () => {
   const { generatePairingCode } = createPairing({
     keyStore: createMemoryKeyStore(),
     transport: createMemoryTransportPair()[0],
   });
   for (let i = 0; i < 20; i++) {
     const code = await generatePairingCode();
-    assert.match(code, /^[A-Z]{4}-[0-9]{4}$/);
-    assert.ok(PAIRING_WORDS.includes(code.slice(0, 4)));
+    assert.match(code, /^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$/);
+    const [w1, w2] = code.split('-');
+    assert.ok(PAIRING_WORDS.includes(w1));
+    assert.ok(PAIRING_WORDS.includes(w2));
   }
 });
 

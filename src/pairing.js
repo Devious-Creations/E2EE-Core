@@ -82,15 +82,20 @@ export const PAIRING_WORDS = [
 // ── Pure helpers (no seams) ───────────────────────────────────────────────────
 
 /**
- * Generate a human-readable pairing code: WORD-NNNN (e.g. WOLF-7392).
+ * Generate a human-readable pairing code: WORD-WORD-NNNN (e.g. WOLF-DAWN-7392).
  * The code is a rendezvous identifier, not the trust anchor — trust comes
- * from the SAS comparison after the committed key exchange.
+ * from the SAS comparison after the committed key exchange. Two words + four
+ * digits give 48*48*10000 ≈ 23M codes: with the 120s code lifetime that makes
+ * online guessing of an active rendezvous statistically dead even without a
+ * server-side join rate limit (DeviousByDC#433 — the old WORD-NNNN space of
+ * 480k was small enough to worry about).
  * @returns {Promise<string>}
  */
 export async function generatePairingCode() {
   const wordIdx = await primitives.randomInt(PAIRING_WORDS.length);
+  const wordIdx2 = await primitives.randomInt(PAIRING_WORDS.length);
   const num = await primitives.randomInt(10000);
-  return `${PAIRING_WORDS[wordIdx]}-${String(num).padStart(4, '0')}`;
+  return `${PAIRING_WORDS[wordIdx]}-${PAIRING_WORDS[wordIdx2]}-${String(num).padStart(4, '0')}`;
 }
 
 /**
