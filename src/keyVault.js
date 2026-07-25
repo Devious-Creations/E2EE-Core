@@ -56,11 +56,13 @@ export async function generateSharedKey() {
  * @param {string} password
  * @param {Uint8Array} salt - 32-byte salt
  * @param {{ v:number, algo:string, N?:number, r?:number, p?:number, iterations?:number }} [kdf=CURRENT_KDF]
+ * @param {(fraction: number) => void} [onProgress] - optional, forwarded to the
+ *   scrypt branch so callers can show progress during KEK derivation.
  * @returns {Promise<Uint8Array>} 32-byte KEK
  */
-export async function deriveKEK(password, salt, kdf = CURRENT_KDF) {
+export async function deriveKEK(password, salt, kdf = CURRENT_KDF, onProgress) {
   if (kdf.algo === 'scrypt') {
-    return primitives.scrypt(password, salt, { N: kdf.N, r: kdf.r, p: kdf.p, dkLen: DEK_LENGTH });
+    return primitives.scrypt(password, salt, { N: kdf.N, r: kdf.r, p: kdf.p, dkLen: DEK_LENGTH }, onProgress);
   }
   if (kdf.algo === 'pbkdf2-sha256') {
     return primitives.pbkdf2(password, salt, kdf.iterations, DEK_LENGTH);

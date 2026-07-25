@@ -235,12 +235,18 @@ export async function pbkdf2(password, salt, iterations, keyLength) {
 /**
  * Derive a key from a password and salt using scrypt (memory-hard, so GPU/ASIC
  * offline brute force can't be parallelized cheaply the way PBKDF2 can).
+ *
+ * Uses @noble/hashes' ASYNC scrypt (chunked with event-loop yields) rather
+ * than the sync one — on React Native the sync version blocks the JS thread
+ * for 10-40s at these params, freezing the app. Same algorithm, same output.
  * @param {string|Uint8Array} password
  * @param {Uint8Array} salt
  * @param {{ N: number, r: number, p: number, dkLen: number }} params
+ * @param {(fraction: number) => void} [onProgress] - optional, called with a
+ *   value in (0, 1] as the derivation progresses.
  * @returns {Promise<Uint8Array>}
  */
-export async function scrypt(password, salt, { N, r, p, dkLen }) {
-  const { scrypt: _scrypt } = await import('@noble/hashes/scrypt.js');
-  return _scrypt(password, salt, { N, r, p, dkLen });
+export async function scrypt(password, salt, { N, r, p, dkLen }, onProgress) {
+  const { scryptAsync: _scryptAsync } = await import('@noble/hashes/scrypt.js');
+  return _scryptAsync(password, salt, { N, r, p, dkLen, onProgress });
 }

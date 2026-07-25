@@ -46,6 +46,30 @@ test('scrypt: deterministic for the same input, memory-hard params', async () =>
   assert.notDeepEqual(k1, k3);
 });
 
+test('scrypt: async output is byte-identical to the sync implementation (KAT)', async () => {
+  const { scrypt: _scryptSync } = await import('@noble/hashes/scrypt.js');
+  const pw = 'correct horse battery staple';
+  const salt = Uint8Array.from(
+    Array.from({ length: 32 }, (_, i) => i),
+  );
+  const params = { N: 1024, r: 8, p: 1, dkLen: 32 }; // small N — this is a KAT, not a perf test
+  const expected = _scryptSync(pw, salt, params);
+  const actual = await P.scrypt(pw, salt, params);
+  assert.deepEqual(actual, expected);
+});
+
+test('scrypt: onProgress is invoked with a fraction in (0, 1]', async () => {
+  const pw = 'progress check';
+  const salt = await P.randomBytes(32);
+  const params = { N: 1024, r: 8, p: 1, dkLen: 32 };
+  const fractions = [];
+  await P.scrypt(pw, salt, params, (fraction) => fractions.push(fraction));
+  assert.ok(fractions.length >= 1);
+  for (const f of fractions) {
+    assert.ok(typeof f === 'number' && f > 0 && f <= 1);
+  }
+});
+
 test('pbkdf2 + sha256 + hmac produce fixed-length output', async () => {
   const salt = await P.randomBytes(16);
   const k = await P.pbkdf2('pw', salt, 10_000, 32);
