@@ -145,13 +145,29 @@ derivation.
 
 Messages between paired devices are encrypted with a **symmetric-key ratchet**
 rooted at K_pair: chain keys advance via HMAC, each message gets a fresh message
-key, used keys are deleted (forward secrecy along the chain), out-of-order
-messages are handled with a bounded skipped-key cache, and replays are rejected.
-**Note the honest limitation:** this is a *chain-key* ratchet from a static root,
-not a full Double Ratchet with per-message Diffie-Hellman — so it does **not**
-provide post-compromise security (a compromised chain state stays compromised
-until re-pairing). We think that's an acceptable trade for this app's model, but
-it is exactly the kind of decision an audit should challenge.
+key, used keys are deleted, out-of-order messages are handled with a bounded
+skipped-key cache, and replays are rejected.
+**Note the honest limitations** — there are two, and deleting used keys does not
+buy you out of either:
+
+1. **No forward secrecy for the archive.** K_pair is retained verbatim
+   (`storePairing` writes it to `pairing_key_<id>`), and `loadState`/`initState`
+   deterministically re-derive **both** chains from counter 0 given only that
+   root. So anything that yields chain state — or just the stored pairing key —
+   yields the root, and the root re-derives the entire history. Discarding
+   `ck_n` after each step only defeats an attacker who recovers one chain key in
+   isolation, which is not the threat that matters here. Real forward secrecy
+   would require deleting K_pair after chain init (losing the ability to
+   re-initialise) or a DH ratchet. Exposure is bounded in practice by the 7-day
+   relay retention, so the honest statement is "the last 7 days of ciphertext",
+   not "all history". See the matching note at the top of `src/ratchet.js`.
+2. **No post-compromise security.** This is a *chain-key* ratchet from a static
+   root, not a full Double Ratchet with per-message Diffie-Hellman, so a
+   compromised chain state stays compromised until re-pairing.
+
+We think both are acceptable trades for this app's model, but they are exactly
+the kind of decision an audit should challenge — and they must not be described
+as forward secrecy anywhere in user-facing copy.
 
 A purge/unpair replaces surviving chain state with a fingerprinted **tombstone**:
 the ratchet then refuses to re-derive chains for the *same* root key, so a stale
