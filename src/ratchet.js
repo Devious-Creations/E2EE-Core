@@ -18,9 +18,23 @@
 //   mk_n         = HMAC(ck_n, 0x01)   — per-message key (XSalsa20-Poly1305)
 //   ck_{n+1}     = HMAC(ck_n, 0x02)   — next chain key; ck_n is then discarded
 //
-// Because ck_n is discarded after each step, compromising a device's current
-// chain state exposes only future traffic and the bounded skipped-key cache —
-// not the message history (forward secrecy for the archive).
+// NO FORWARD SECRECY FOR THE ARCHIVE. Discarding ck_n after each step only
+// protects against an attacker who recovers a chain key in isolation — that
+// is not the threat that matters here, because K_pair itself is retained
+// verbatim (storePairing writes it to `pairing_key_<id>`, see pairing.js) and
+// loadState/initState deterministically re-derive BOTH chains from counter 0
+// given only that root. So anything that yields chain state (or just the
+// stored pairing key) yields the root, and the root re-derives the entire
+// history. Real forward secrecy would mean either deleting K_pair once the
+// chains are seeded (which breaks re-initialisation after an app
+// reinstall/restore, since there would be nothing left to derive from) or
+// adding an actual per-message DH ratchet — neither is done. The real bound
+// on exposure is operational, not cryptographic: relay_messages ciphertext is
+// purged after 7 days (see the app's relay retention migration), so a
+// compromised root exposes at most that rolling 7-day window of archived
+// ciphertext, not "only future traffic." Also note the serialized chain
+// state at rest can hold up to MAX_SKIPPED_KEYS (1000) live, undelivered
+// message keys alongside the chain keys.
 //
 // OUT-OF-ORDER DELIVERY
 // Handled Signal-style: a forward jump derives and caches the skipped message
