@@ -147,12 +147,47 @@ export async function buildRecoveryEntries(dek, codes) {
   return entries;
 }
 
+// ── recovery_keys shape-check (the list is untrusted server input for every
+// consumer of this library) ──
+// The loop below walks the list one PBKDF2 (10k) per entry until it finds a
+// hash match — a non-array turns the loop into a bare TypeError, and an
+// unbounded list turns recovery into a hang rather than an error. Bounds and
+// field names mirror the app-side check (Smaddle-App's
+// recoveryFlow.assertValidRecoveryKeys) so every consumer rejects the same
+// malformed shapes the app already does.
+const MAX_RECOVERY_ENTRIES = 20;
+const RECOVERY_ENTRY_FIELDS = ['hash', 'wrappedDek', 'nonce', 'salt'];
+const MIN_ENTRY_FIELD_LENGTH = 16;
+const MAX_ENTRY_FIELD_LENGTH = 256;
+
+/**
+ * Shape-check a `recovery_keys` list before any entry is used to unwrap.
+ * @param {unknown} entries - the list as received from storage/network
+ * @throws {Error} when the list can't be trusted
+ */
+export function assertValidRecoveryKeys(entries) {
+  if (!Array.isArray(entries)) throw new Error('recovery_keys: expected an array');
+  if (entries.length < 1) throw new Error('recovery_keys: must not be empty');
+  if (entries.length > MAX_RECOVERY_ENTRIES) throw new Error('recovery_keys: too many entries');
+  for (const entry of entries) {
+    if (entry == null || typeof entry !== 'object') throw new Error('recovery_keys: malformed entry');
+    for (const field of RECOVERY_ENTRY_FIELDS) {
+      const value = entry[field];
+      if (typeof value !== 'string') throw new Error(`recovery_keys: entry.${field} must be a string`);
+      if (value.length < MIN_ENTRY_FIELD_LENGTH || value.length > MAX_ENTRY_FIELD_LENGTH) {
+        throw new Error(`recovery_keys: entry.${field} has an invalid length`);
+      }
+    }
+  }
+}
+
 /**
  * Find and use a recovery code to unwrap the DEK.
  * @returns {Promise<{ dek: Uint8Array, matchIndex: number }>}
- * @throws {Error} if no matching entry found
+ * @throws {Error} if `entries` fails the shape-check, or if no matching entry found
  */
 export async function unwrapWithRecoveryCode(code, entries) {
+  assertValidRecoveryKeys(entries);
   for (let i = 0; i < entries.length; i++) {
     const salt = await primitives.decodeBase64(entries[i].salt);
     const codeHash = await hashCode(code, salt);

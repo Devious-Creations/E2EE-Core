@@ -61,6 +61,44 @@ test('createKeyVault: DEK persistence + wrap-to-master round-trips', async () =>
   await assert.rejects(() => vault.wrapKeyToMaster(key), /No master DEK/);
 });
 
+test('assertValidRecoveryKeys: valid list passes', async () => {
+  const dek = await V.generateDEK();
+  const codes = await V.generateRecoveryCodes(2);
+  const entries = await V.buildRecoveryEntries(dek, codes);
+  assert.doesNotThrow(() => V.assertValidRecoveryKeys(entries));
+});
+
+test('assertValidRecoveryKeys: non-array is rejected', () => {
+  assert.throws(() => V.assertValidRecoveryKeys(null), /expected an array/);
+  assert.throws(() => V.assertValidRecoveryKeys('not-an-array'), /expected an array/);
+  assert.throws(() => V.assertValidRecoveryKeys({ hash: 'x' }), /expected an array/);
+});
+
+test('assertValidRecoveryKeys: empty list is rejected', () => {
+  assert.throws(() => V.assertValidRecoveryKeys([]), /must not be empty/);
+});
+
+test('assertValidRecoveryKeys: oversized list is rejected', () => {
+  const entry = { hash: 'a'.repeat(44), wrappedDek: 'b'.repeat(64), nonce: 'c'.repeat(32), salt: 'd'.repeat(44) };
+  assert.throws(() => V.assertValidRecoveryKeys(Array(21).fill(entry)), /too many entries/);
+});
+
+test('assertValidRecoveryKeys: malformed entries are rejected', () => {
+  const valid = { hash: 'a'.repeat(44), wrappedDek: 'b'.repeat(64), nonce: 'c'.repeat(32), salt: 'd'.repeat(44) };
+  assert.throws(() => V.assertValidRecoveryKeys([null]), /malformed entry/);
+  assert.throws(() => V.assertValidRecoveryKeys(['not-an-object']), /malformed entry/);
+  assert.throws(() => V.assertValidRecoveryKeys([{ ...valid, hash: 12345 }]), /entry\.hash must be a string/);
+  assert.throws(() => V.assertValidRecoveryKeys([{ ...valid, nonce: 'short' }]), /entry\.nonce has an invalid length/);
+  assert.throws(() => V.assertValidRecoveryKeys([{ ...valid, salt: 'x'.repeat(300) }]), /entry\.salt has an invalid length/);
+  const missingField = { hash: valid.hash, wrappedDek: valid.wrappedDek, nonce: valid.nonce };
+  assert.throws(() => V.assertValidRecoveryKeys([missingField]), /entry\.salt must be a string/);
+});
+
+test('unwrapWithRecoveryCode: rejects an invalid recovery_keys shape before touching entries', async () => {
+  await assert.rejects(() => V.unwrapWithRecoveryCode('ZZZZ-ZZZZ-ZZZZ', 'not-an-array'), /expected an array/);
+  await assert.rejects(() => V.unwrapWithRecoveryCode('ZZZZ-ZZZZ-ZZZZ', []), /must not be empty/);
+});
+
 test('createKeyVault: per-dynamic key store/load/shred', async () => {
   const vault = V.createKeyVault(createMemoryKeyStore());
   const kB64 = await P.encodeBase64(await V.generateSharedKey());
