@@ -34,7 +34,7 @@ line('e2ee-core — end-to-end demo (all against in-memory adapters)\n');
 step(1, 'Alice creates an account (password → scrypt KEK → wrapped DEK)');
 const password = 'correct horse battery staple';
 const salt = await P.randomBytes(32);
-const kek = await keyVault.deriveKEK(password, salt); // scrypt N=2^15,r=8,p=3
+const kek = await keyVault.deriveKEK(password, salt); // scrypt N=2^16,r=8,p=1
 const dek = await keyVault.generateDEK(); // random 32B — encrypts Alice's backup
 const wrapped = await keyVault.wrapDEK(dek, kek); // this is what the SERVER stores
 await aliceVault.storeDEK(await P.encodeBase64(dek)); // device caches the unwrapped DEK

@@ -238,7 +238,18 @@ export async function pbkdf2(password, salt, iterations, keyLength) {
  *
  * Uses @noble/hashes' ASYNC scrypt (chunked with event-loop yields) rather
  * than the sync one — on React Native the sync version blocks the JS thread
- * for 10-40s at these params, freezing the app. Same algorithm, same output.
+ * for 9-35s at the current params (v3: N=2^16, r=8, p=1), freezing the app.
+ * Same algorithm, same output.
+ *
+ * Note the memory: @noble allocates ONE contiguous Uint8Array of 128*r*N for
+ * the scratch buffer V — 64 MiB at v3 — regardless of p. p costs time, not
+ * memory.
+ *
+ * That buffer is also why v3 is only ~13% faster than v2 despite doing 2/3 the
+ * block-mixes: measured here, each block-mix costs ~31% more at a 64 MiB
+ * working set than at 32 MiB (cache/TLB pressure). That extra cost per unit of
+ * work is the memory-hardness earning its keep — it is charged to an attacker
+ * too, and they cannot amortize it away.
  * @param {string|Uint8Array} password
  * @param {Uint8Array} salt
  * @param {{ N: number, r: number, p: number, dkLen: number }} params

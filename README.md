@@ -61,7 +61,7 @@ in one process (that is exactly what the tests do).
 ## Key hierarchy
 
 ```
-  password ──scrypt(N=2^15,r=8,p=3)──▶ KEK ──secretbox──▶ [ wrapped DEK ]   (stored server-side)
+  password ──scrypt(N=2^16,r=8,p=1)──▶ KEK ──secretbox──▶ [ wrapped DEK ]   (stored server-side)
                                                               │
   recovery code ──pbkdf2(10k)──▶ recovery-KEK ──secretbox──▶ ┘  (alternate unwrap path)
                                                               │
@@ -79,8 +79,11 @@ in one process (that is exactly what the tests do).
 
 - **DEK** (Data Encryption Key, random 32 bytes) encrypts the user's own cloud
   backup. It is wrapped by a **KEK** derived from the password via **scrypt**
-  (N=2¹⁵, r=8, p=3 — memory-hard, ~32 MiB). Only the *wrapped* DEK is stored
-  server-side; the password and unwrapped DEK never leave the device.
+  (v3: N=2¹⁶, r=8, p=1 — memory-hard, ~64 MiB). Only the *wrapped* DEK is stored
+  server-side; the password and unwrapped DEK never leave the device. Vaults
+  written under v1 (PBKDF2-10k) or v2 (scrypt N=2¹⁵/r=8/p=3, ~32 MiB) still
+  open — the stored `kdf` descriptor says which — and are re-wrapped at v3 on
+  the next successful password unwrap.
 - **Recovery codes** (8 codes, 12 chars from a 32-symbol confusable-free
   alphabet ≈ 60 bits each) wrap the DEK via a cheaper KDF (**PBKDF2**-SHA256,
   10k) — high entropy needs no stretching.
@@ -202,8 +205,10 @@ normally.
 3. **The ratchet** in `ratchet.js` — chain-key derivation, nonce/counter
    handling, the skipped-key cache bound (`MAX_SKIPPED_KEYS`), and whether the
    replay rejection is watertight.
-4. **KDF parameters** — is scrypt N=2¹⁵/r=8/p=3 an appropriate 2025 choice for a
-   phone? Are the recovery-code entropy (~60 bits) and PBKDF2-10k defensible?
+4. **KDF parameters** — is scrypt N=2¹⁶/r=8/p=1 (~64 MiB) an appropriate 2025
+   choice for a phone, including on low-end Android where that is one
+   contiguous allocation? Are the recovery-code entropy (~60 bits) and
+   PBKDF2-10k defensible?
 5. **Nonce hygiene** — every `secretbox` nonce is a fresh 24 random bytes; is
    there any path where a nonce could be reused under a fixed key?
 6. **The sealed-box construction** — `sealBox` is `crypto_box_seal` rebuilt from

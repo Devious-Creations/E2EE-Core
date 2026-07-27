@@ -18,6 +18,77 @@ test('DEK wrap/unwrap under a scrypt KEK round-trips; wrong password fails', asy
   await assert.rejects(() => V.unwrapDEK(wrappedDek, nonce, wrongKek));
 });
 
+test('KDF descriptors: v1 and v2 stay intact, v3 is current', () => {
+  // v1/v2 are load-bearing for vaults already in the field — freezing their
+  // exact shape here means a re-tune can never silently orphan them.
+  assert.deepEqual({ ...V.KDF_PBKDF2_LEGACY }, { v: 1, algo: 'pbkdf2-sha256', iterations: 10_000 });
+  assert.deepEqual({ ...V.KDF_SCRYPT }, { v: 2, algo: 'scrypt', N: 32768, r: 8, p: 3 });
+  assert.deepEqual({ ...V.KDF_SCRYPT_V3 }, { v: 3, algo: 'scrypt', N: 65536, r: 8, p: 1 });
+  assert.equal(V.CURRENT_KDF, V.KDF_SCRYPT_V3);
+});
+
+test('KDF re-tune never weakens: working set grows, version is monotonic', () => {
+  // @noble allocates one contiguous 128*r*N scratch buffer; p costs time, not
+  // memory. The new params must not shrink that buffer below what v2 forced.
+  const workingSet = (k) => 128 * k.r * k.N;
+  assert.equal(workingSet(V.KDF_SCRYPT), 32 * 1024 * 1024);
+  assert.equal(workingSet(V.KDF_SCRYPT_V3), 64 * 1024 * 1024);
+  assert.ok(workingSet(V.CURRENT_KDF) >= workingSet(V.KDF_SCRYPT));
+  assert.ok(V.CURRENT_KDF.v > V.KDF_SCRYPT.v);
+  assert.ok(V.KDF_SCRYPT.v > V.KDF_PBKDF2_LEGACY.v);
+});
+
+test('a vault wrapped under v2 still opens after the re-tune, then re-wraps to v3', async () => {
+  // The upgrade path in the app, end to end against real crypto: unwrap with
+  // the descriptor the vault was WRITTEN with, then re-wrap under CURRENT_KDF.
+  const dek = await V.generateDEK();
+  const oldSalt = await P.randomBytes(32);
+  const oldKek = await V.deriveKEK('hunter2', oldSalt, V.KDF_SCRYPT);
+  const oldWrap = await V.wrapDEK(dek, oldKek);
+
+  // Still openable under v2 — this is the "existing vaults keep working" claim.
+  const reopened = await V.deriveKEK('hunter2', oldSalt, V.KDF_SCRYPT);
+  assert.deepEqual(await V.unwrapDEK(oldWrap.wrappedDek, oldWrap.nonce, reopened), dek);
+
+  // Transparent upgrade: fresh salt, current KDF, same DEK.
+  const newSalt = await P.randomBytes(32);
+  const newKek = await V.deriveKEK('hunter2', newSalt, V.CURRENT_KDF);
+  const newWrap = await V.wrapDEK(dek, newKek);
+  assert.deepEqual(await V.unwrapDEK(newWrap.wrappedDek, newWrap.nonce, newKek), dek);
+
+  // The v2 KEK must not open the v3 wrap — proves the descriptor is really
+  // what selects the parameters, rather than both paths landing on one default.
+  assert.notDeepEqual(oldKek, newKek);
+  await assert.rejects(() => V.unwrapDEK(newWrap.wrappedDek, newWrap.nonce, oldKek));
+});
+
+test('a v1 (PBKDF2) vault opens and jumps straight to v3, skipping v2', async () => {
+  const dek = await V.generateDEK();
+  const oldSalt = await P.randomBytes(32);
+  const oldKek = await V.deriveKEK('hunter2', oldSalt, V.KDF_PBKDF2_LEGACY);
+  const oldWrap = await V.wrapDEK(dek, oldKek);
+  assert.deepEqual(await V.unwrapDEK(oldWrap.wrappedDek, oldWrap.nonce, oldKek), dek);
+
+  // Nothing in the re-wrap depends on the OLD algorithm having been scrypt.
+  const newSalt = await P.randomBytes(32);
+  const newKek = await V.deriveKEK('hunter2', newSalt, V.CURRENT_KDF);
+  const newWrap = await V.wrapDEK(dek, newKek);
+  assert.deepEqual(await V.unwrapDEK(newWrap.wrappedDek, newWrap.nonce, newKek), dek);
+});
+
+test('recovery codes stay on PBKDF2-10k, unaffected by the scrypt re-tune', async () => {
+  // Deliberate: ~60 bits of entropy needs no stretching. If a re-tune ever
+  // dragged recovery onto scrypt, redeeming 8 codes would cost 8 x 64 MiB.
+  const dek = await V.generateDEK();
+  const codes = await V.generateRecoveryCodes(2);
+  const entries = await V.buildRecoveryEntries(dek, codes);
+
+  // Rebuild the KEK by hand under v1 and confirm it opens the recovery wrap.
+  const salt = await P.decodeBase64(entries[0].salt);
+  const kek = await V.deriveKEK(codes[0].replace(/-/g, ''), salt, V.KDF_PBKDF2_LEGACY);
+  assert.deepEqual(await V.unwrapDEK(entries[0].wrappedDek, entries[0].nonce, kek), dek);
+});
+
 test('recovery codes recover the DEK; a wrong code is rejected', async () => {
   const dek = await V.generateDEK();
   const codes = await V.generateRecoveryCodes(4);

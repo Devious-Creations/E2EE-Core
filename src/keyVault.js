@@ -8,7 +8,7 @@
 // dependency at all.
 //
 // Key hierarchy:
-//   password ──scrypt(N=2^15,r=8,p=3)──▶ KEK ──wraps──▶ DEK (random 32B)
+//   password ──scrypt(N=2^16,r=8,p=1)──▶ KEK ──wraps──▶ DEK (random 32B)
 //   DEK ──wraps──▶ K_shared_i (random 32B, one per relationship/"dynamic")
 //   recovery code ──pbkdf2(10k)──▶ recovery-KEK ──wraps──▶ DEK (alt unwrap path)
 // The DEK encrypts the user's cloud backup; each K_shared encrypts one shared
@@ -19,14 +19,25 @@ import * as primitives from './primitives.js';
 // ── KDF parameters (versioned — stored alongside the wrapped DEK) ──
 // v1 (legacy): PBKDF2-SHA256 @ 10k — kept only to unwrap pre-existing vaults
 //   (re-wrapped with the current KDF on sign-in) and for recovery codes.
-// v2 (current): scrypt N=2^15 r=8 p=3 (an OWASP-listed set) — memory-hard
+// v2 (superseded): scrypt N=2^15 r=8 p=3 (an OWASP-listed set) — memory-hard
 //   (~32 MiB), so GPU farms can't parallelize it cheaply. Pure JS via @noble.
+//   Still accepted for unwrapping; no new vault is written with it.
+// v3 (current): scrypt N=2^16 r=8 p=1 — memory-hard (~64 MiB). scrypt's cost to
+//   an attacker is the memory-hard work set by N and r; p only REPEATS that
+//   work in extra lanes and buys no extra memory. So trading p=3 for a doubled
+//   N doubles the working set an ASIC must provision per guess while cutting
+//   the block-mix count to 2/3 (2*N*p: 131072 here vs 196608 at v2) — harder to
+//   attack, and no slower for the user.
+//   Wall-clock is NOT 2/3 though: measured, each block-mix costs ~31% more at a
+//   64 MiB working set than at 32 MiB, so v3 lands ~13% faster than v2 rather
+//   than ~33%. Do not quote the block-mix ratio as a speedup.
 // Recovery codes intentionally stay on the cheap KDF: at ~60 bits of entropy
 // (12 chars x 5 bits/char) they don't need stretching — stretching compensates
 // for LOW-entropy secrets like passwords.
 export const KDF_PBKDF2_LEGACY = Object.freeze({ v: 1, algo: 'pbkdf2-sha256', iterations: 10_000 });
 export const KDF_SCRYPT = Object.freeze({ v: 2, algo: 'scrypt', N: 32768, r: 8, p: 3 });
-export const CURRENT_KDF = KDF_SCRYPT;
+export const KDF_SCRYPT_V3 = Object.freeze({ v: 3, algo: 'scrypt', N: 65536, r: 8, p: 1 });
+export const CURRENT_KDF = KDF_SCRYPT_V3;
 
 const DEK_LENGTH = 32;
 const SALT_LENGTH = 32;
