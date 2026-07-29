@@ -80,7 +80,10 @@ in one process (that is exactly what the tests do).
 - **DEK** (Data Encryption Key, random 32 bytes) encrypts the user's own cloud
   backup. It is wrapped by a **KEK** derived from the password via **scrypt**
   (v3: N=2¹⁶, r=8, p=1 — memory-hard, ~64 MiB). Only the *wrapped* DEK is stored
-  server-side; the password and unwrapped DEK never leave the device. Vaults
+  server-side; this library never transmits the password or the unwrapped DEK.
+  (Boundary note: an app embedding this core may still send that same password
+  to its auth provider during ordinary account sign-in — ours does — so the
+  guarantee here covers the vault key path, not an app's whole auth flow.) Vaults
   written under v1 (PBKDF2-10k) or v2 (scrypt N=2¹⁵/r=8/p=3, ~32 MiB) still
   open — the stored `kdf` descriptor says which — and are re-wrapped at v3 on
   the next successful password unwrap.
@@ -145,13 +148,18 @@ derivation.
 
 Messages between paired devices are encrypted with a **symmetric-key ratchet**
 rooted at K_pair: chain keys advance via HMAC, each message gets a fresh message
-key, used keys are deleted (forward secrecy along the chain), out-of-order
-messages are handled with a bounded skipped-key cache, and replays are rejected.
-**Note the honest limitation:** this is a *chain-key* ratchet from a static root,
-not a full Double Ratchet with per-message Diffie-Hellman — so it does **not**
-provide post-compromise security (a compromised chain state stays compromised
-until re-pairing). We think that's an acceptable trade for this app's model, but
-it is exactly the kind of decision an audit should challenge.
+key, used keys are deleted from device state (key hygiene, not forward
+secrecy — see below), out-of-order messages are handled with a bounded
+skipped-key cache, and replays are rejected.
+**Note the honest limitations:** this is a *chain-key* ratchet from a static
+root, not a full Double Ratchet with per-message Diffie-Hellman. It provides
+**no forward secrecy for the archive** — K_pair is retained and both chains
+re-derive deterministically from counter 0, so a device or keychain compromise
+exposes any ciphertext that still exists to decrypt (bounded by the relay's
+retention window, not by the ratchet). And it does **not** provide
+post-compromise security (a compromised chain state stays compromised until
+re-pairing). We think that's an acceptable trade for this app's model, but it
+is exactly the kind of decision an audit should challenge.
 
 A purge/unpair replaces surviving chain state with a fingerprinted **tombstone**:
 the ratchet then refuses to re-derive chains for the *same* root key, so a stale
