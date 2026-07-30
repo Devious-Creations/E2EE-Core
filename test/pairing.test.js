@@ -16,11 +16,15 @@ import assert from 'node:assert/strict';
 import { createPairing, buildRelayChannelName, PAIRING_WORDS } from '../src/pairing.js';
 import { createMemoryTransportPair } from '../adapters/memoryTransport.js';
 import { createMemoryKeyStore } from '../adapters/memoryKeyStore.js';
+import * as primitives from '../src/primitives.js';
 
 // Two distinct, well-formed v4 UUIDs (must satisfy the handshake's UUID_RE and
 // differ — a party never pairs with its own id).
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
+// A THIRD identity, used to simulate a second device answering the same code
+// (the contested-path tests below).
+const UUID_C = '33333333-3333-4333-8333-333333333333';
 
 // Run one full handshake and return both resolved results plus the state logs.
 async function runHandshake(code = 'WOLF-7392') {
@@ -168,6 +172,136 @@ test('createPairing: rejects a missing KeyStore; a Transport is only needed to h
 
   // …but attempting a handshake without a transport throws.
   await assert.rejects(() => storeOnly.initiatePairing('WOLF-0001', 'user-1', () => {}), /Transport/);
+});
+
+// ── Contested-path tests ──────────────────────────────────────────────────────
+// The handshake locks to the first responding identity; ANY second identity
+// (or a mismatching duplicate) aborts fatally — the `settled` flag it sets
+// makes the handshake promise reject and ignore every subsequent message. These
+// tests craft the extra/conflicting messages directly, the same way the
+// "transport.onError fails an in-flight handshake immediately" test above
+// manipulates the transport object directly, rather than running two
+// cooperating controllers.
+//
+// createRawTransport (rather than createMemoryTransportPair) is used here on
+// purpose: its `close()` is a no-op, so a probe message sent AFTER the
+// handshake has already failed can only be blocked by the handshake's own
+// `settled` guard, not by the transport tearing itself down. That is what
+// proves the abort is fatal at the pairing.js level, not just "the pipe closed."
+function createRawTransport() {
+  const handlers = new Map();
+  return {
+    send() {}, // this file drives the handshake purely by injecting inbound messages
+    on(event, handler) {
+      if (!handlers.has(event)) handlers.set(event, new Set());
+      handlers.get(event).add(handler);
+    },
+    close() {},
+    // Directly deliver a crafted/duplicate message to the handshake's handler(s)
+    // for `event`, simulating another device broadcasting on the same code.
+    emit(event, payload) {
+      const set = handlers.get(event);
+      if (!set) return;
+      for (const h of [...set]) h(payload);
+    },
+  };
+}
+
+// A base64 string that decodes to exactly 32 bytes — satisfies the handshake's
+// decode32() shape check for a publicKey/commit/mac field without needing to
+// correspond to any real key (the contested paths below fail before any such
+// correspondence would be checked).
+async function random32Base64() {
+  return primitives.encodeBase64(await primitives.randomBytes(32));
+}
+
+test('contested: a second, different partner id after lock rejects fatally and blocks revival', async () => {
+  const transport = createRawTransport();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  const states = [];
+  const attempt = A.initiatePairing('WOLF-9001', UUID_A, (s) => states.push(s));
+  const rejection = assert.rejects(() => attempt, /Pairing contested/);
+
+  await new Promise((r) => setTimeout(r, 20)); // let the initiator register its handlers
+
+  // First responder locks partnerId = UUID_B.
+  transport.emit('pair_response', { userId: UUID_B, publicKey: await random32Base64() });
+  await new Promise((r) => setTimeout(r, 20)); // let deriveSession + the pair_reveal send settle
+
+  // A second, different (but otherwise well-formed) device answers the same
+  // code — contested.
+  transport.emit('pair_response', { userId: UUID_C, publicKey: await random32Base64() });
+
+  await rejection;
+  const statesAtReject = states.length;
+
+  // Fatal: a subsequent, well-formed message for the same handshake (even a
+  // confirm from the ORIGINAL locked partner) must not revive it — no further
+  // state progress, no second settlement, and (implicitly) no unhandled
+  // rejection since the promise only ever settles once.
+  const revivalMac = await random32Base64();
+  assert.doesNotThrow(() => transport.emit('pair_confirm', { userId: UUID_B, mac: revivalMac }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(states.length, statesAtReject, 'no further onStateChange after the fatal abort');
+});
+
+test('contested: a duplicate commit with a mismatched value rejects fatally', async () => {
+  const transport = createRawTransport();
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  const states = [];
+  const attempt = B.joinPairing('WOLF-9002', UUID_B, (s) => states.push(s));
+  const rejection = assert.rejects(() => attempt, /Pairing contested/);
+
+  await new Promise((r) => setTimeout(r, 20)); // let the joiner register its handlers
+
+  // First commit from the (locked) initiator identity.
+  transport.emit('pair_commit', { userId: UUID_A, commit: await random32Base64() });
+  await new Promise((r) => setTimeout(r, 20));
+
+  // A second commit, same identity, but a DIFFERENT value — contested.
+  transport.emit('pair_commit', { userId: UUID_A, commit: await random32Base64() });
+
+  await rejection;
+  const statesAtReject = states.length;
+
+  // Fatal: a well-formed reveal for the same handshake does not revive it.
+  const revivalKey = await random32Base64();
+  assert.doesNotThrow(() =>
+    transport.emit('pair_reveal', { userId: UUID_A, publicKey: revivalKey }),
+  );
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(states.length, statesAtReject, 'no further onStateChange after the fatal abort');
+});
+
+test('contested: a duplicate response with a different public key rejects fatally', async () => {
+  const transport = createRawTransport();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  const states = [];
+  const attempt = A.initiatePairing('WOLF-9003', UUID_A, (s) => states.push(s));
+  const rejection = assert.rejects(() => attempt, /Pairing contested/);
+
+  await new Promise((r) => setTimeout(r, 20)); // let the initiator register its handlers
+
+  // First response locks the partner id AND the partner public key.
+  transport.emit('pair_response', { userId: UUID_B, publicKey: await random32Base64() });
+  await new Promise((r) => setTimeout(r, 20)); // let deriveSession settle
+
+  // A duplicate response, same partner id, but a DIFFERENT public key —
+  // contested (this is not the "missed our reveal, resend" case, which
+  // requires the SAME key).
+  transport.emit('pair_response', { userId: UUID_B, publicKey: await random32Base64() });
+
+  await rejection;
+  const statesAtReject = states.length;
+
+  // Fatal: a well-formed confirm for the same handshake does not revive it.
+  const revivalMac = await random32Base64();
+  assert.doesNotThrow(() => transport.emit('pair_confirm', { userId: UUID_B, mac: revivalMac }));
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(states.length, statesAtReject, 'no further onStateChange after the fatal abort');
 });
 
 test('transport.onError fails an in-flight handshake immediately', async () => {
