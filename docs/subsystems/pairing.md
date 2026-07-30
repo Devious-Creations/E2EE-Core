@@ -154,8 +154,9 @@ not the handshake itself:
 
 ## Deliberately not done
 
-- No recoverable-contested-pairing path (see above — an open question, not
-  a decision).
+- No recoverable-contested-pairing path — deliberately deferred 2026-07-30,
+  not rejected (see above; scheduled behind the app's server-side
+  pairing-topic claim).
 - No server-side rate limiting of pairing-code guesses — out of scope for a
   crypto-core package with no network awareness.
 - No re-verification/reset UI for a pairing gone bad; that is app-layer.
