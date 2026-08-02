@@ -1,4 +1,4 @@
-> **Verified against:** `e2235f5` · 2026-07-30 · by coder (#142 backfill)
+> **Verified against:** branch `fix/scrypt-async-tick` (uncommitted at time of writing) · 2026-08-02 · by fable
 
 # Primitives — the audited-library wrapper
 
@@ -45,6 +45,19 @@ doing 2/3 the block-mixes: cache/TLB pressure at the larger working set eats
 part of the saving (`src/primitives.js:244-252`). **Do not use the
 block-mix-count ratio to predict wall-clock speedup** — it doesn't hold, and
 the file says so explicitly.
+
+**`scrypt` pins `asyncTick: 200` instead of noble's default 10** (same
+comment block): the yield between work chunks is a scheduler round-trip, and
+a consumer whose yield is a real macrotask (the app patches noble's
+`nextTick` to `setTimeout(0)` so the UI actually runs between chunks) pays
+1–15 ms per yield. At tick=10 the derivation yields ~100×/s and the waits
+dominate the wall clock — measured 2026-08-02 at v3 params: 16.7 s total of
+which 0.7 s was scrypt; tick=200 took 0.55 s, byte-identical output (the
+sync-vs-async KAT in `test/primitives.test.js` pins that). The trade is
+progress/paint granularity only: ~5 yields per second, coarser but
+sufficient. Consumers that leave `nextTick` as a microtask see no meaningful
+change either way. **Do not "restore" the default tick to make progress
+smoother** — that reintroduces the minutes-long derivations on device.
 
 **`randomInt` uses rejection sampling, not modulo, over random bytes**
 (`src/primitives.js:203-219`): plain `value % maxExclusive` over uniform
