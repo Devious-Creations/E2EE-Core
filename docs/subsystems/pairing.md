@@ -1,4 +1,4 @@
-> **Verified against:** `e2235f5` · 2026-07-30 · by coder (#142 backfill)
+> **Verified against:** branch `feat/qr-commitment-hooks` · 2026-08-02 · by coder (board #233 step 6 phase A)
 
 # Pairing — the X25519 + SAS handshake
 
@@ -20,6 +20,129 @@ implies no machine-in-the-middle. The five-step protocol
 specifically so a MITM cannot grind its own keypair after seeing the other
 side's public key to force a matching SAS (`src/pairing.js:24-28,
 288-291`).
+
+## Out-of-band commitment delivery (QR path) — board #233
+
+The wire commit alone cannot authenticate anything: it travels over the same
+untrusted `Transport` as everything else, so a MITM sitting between the two
+devices simply substitutes its own `pair_commit` **and** its own matching
+`pair_reveal` together — the commitment only ever stopped SAS-*grinding*
+(picking a key after seeing the other side's), never impersonation. Two
+hooks let a caller deliver that same commitment through a channel a MITM
+cannot reach — a QR code scanned camera-to-screen between the two devices —
+so the app can authenticate the pairing *before* the SAS step even runs.
+Neither hook changes the wire protocol, message shapes, the transcript, or
+the SAS; they are additions gated on the new options being present.
+
+**API shape: a trailing options bag, not a 4th positional.** `onStateChange`
+stays positional (existing 3-arg callers are unaffected); `onCommit` and
+`expectedCommit` are role-dependent and NOT the same type, so a shared
+positional slot would be a footgun (a joiner's string landing in an
+initiator's callback slot, or vice versa) and a future addition would need a
+5th positional, which does not scale. Both entry points take the bag as their
+4th, optional argument:
+
+```js
+await pairing.initiatePairing(code, userId, onStateChange, { onCommit });
+await pairing.joinPairing(code, userId, onStateChange, { expectedCommit });
+```
+
+(`src/pairing.js:193-221`, threaded into `performHandshake(code, userId, role,
+onStateChange, options)` at `src/pairing.js:223-224`.) Consumers pin this
+package to an exact commit, so no released consumer used these hooks yet when
+they were introduced — the API was still free to move. That window closes the
+moment a consumer bumps its pin to a commit containing them.
+
+**Both options are validated up front, before anything else runs**
+(`src/pairing.js:224-239`): `onCommit` (if present) must be a function,
+`expectedCommit` (if present) must be a base64-encoded 32-byte digest (shape
+checked, so a base64url or truncated value from a QR round-trip is the
+caller's bug, not a user-facing attack warning), and an unrecognised option
+key is rejected outright (a typo like `expectedCommmit` would otherwise read
+as "no verification requested"). `performHandshake` is `async`, so these
+surface as an immediate promise REJECTION — before any transport activity or
+key generation — not as a synchronous throw; callers must `await` or
+`.catch`. Before this validation existed, a
+wrong-typed `onCommit` (e.g. a string) was silently ignored — the QR was
+never rendered and the handshake proceeded, unauthenticated, with no signal
+to the caller that anything was wrong — and a wrong-typed `expectedCommit`
+(e.g. `null`, the natural initial value of a caller's `useState(null)`, or
+`''`) would have been carried into the mismatch checks below and could
+render an attack warning for what is actually a programmer bug. Both are now
+a loud, immediate rejection instead.
+
+- **`onCommit`** (`src/pairing.js:263-284`): called once with the base64
+  commitment (`sha256(pk_I)`) the instant it's computed, on the initiator
+  path only, before the `pair_commit` broadcast loop starts — so the caller
+  can render it into a QR. It is called inside a `try/catch`, and if it
+  returns a thenable, a no-op rejection handler is attached to that too
+  (`src/pairing.js:277-279`): an **async** `onCommit` that later rejects would
+  otherwise become an unhandled promise rejection, which under Node's default
+  terminates the process — and QR rendering is exactly the kind of thing a
+  caller writes as `async`. Precisely: a throwing or slow **synchronous**
+  callback cannot break the handshake and cannot eat into its timeout budget
+  (the try/catch swallows a throw; a slow synchronous call still blocks that
+  turn of the event loop for as long as it runs, same as any other synchronous
+  call here — it does *not* "never stall"). `onStateChange` itself gets no
+  such guard today; this is a deliberately *stricter* treatment for the new
+  hook, not a mirror of an existing one. The joiner never receives `onCommit`
+  — it is gated on `role === 'initiator'`.
+- **`expectedCommit`** (`src/pairing.js:426-536`): the base64 commitment
+  obtained out-of-band (e.g. scanned from the initiator's QR), in the SAME
+  encoding `primitives.encodeBase64` produces (standard RFC 4648 base64 WITH
+  padding — this package does **not** accept base64url (`-`/`_`) or
+  unpadded input; `decode32` rejects both, since it goes through
+  `primitives.decodeBase64` → `tweetnacl-util`, which is strict. **If a QR
+  encoding pipeline uses base64url, the caller must convert to standard
+  base64 before passing `expectedCommit`** — this crypto core will not do
+  that conversion for you.
+
+  When present:
+  1. **Commit-stage gate, the PRIMARY defence** (`src/pairing.js:426-457`): on
+     `pair_commit`, the wire's commit is decoded and byte-compared (via
+     `timingSafeEqual`, reusing the already-decoded `commitBytes` — not a raw
+     string compare, since an equivalent re-encoding of the same digest is
+     routine for QR encoders and must not read as an attack) against
+     `expectedCommit`, **before** `pair_response` is ever sent. This is the
+     check that actually stops a consistent-substitution MITM: pinning the
+     wire commit to the out-of-band value before any response goes out means
+     such a MITM's `pair_commit` never gets a response and the handshake never
+     reaches `pair_reveal` at all. **This gate must never be removed as a mere
+     "fail-fast nicety"** — it is not redundant with the reveal-stage check
+     below.
+  2. **Reveal-stage re-hash, defence-in-depth** (`src/pairing.js:514-536`): on
+     `pair_reveal`, the revealed key is independently re-hashed and checked
+     against `expectedCommit` directly — never against the already-stored,
+     wire-derived `partnerCommit`. This exists to preserve the same guarantee,
+     and to surface the more specific `QR_COMMITMENT_MISMATCH_ERROR` rather
+     than `TAMPERED_ERROR`, **if the commit-stage gate above is ever weakened
+     or bypassed** — it is not the primary mechanism and must not be relied on
+     alone.
+  3. Either mismatch is a hard, fatal, non-recoverable abort with the new
+     `QR_COMMITMENT_MISMATCH_ERROR` message (`src/pairing.js:70-78`) — no
+     retry, no fallback path, no session ever derived, no `sharedKey` ever
+     returned. The thrown `Error` also carries `err.code ===
+     'QR_COMMITMENT_MISMATCH'` (`src/pairing.js:80-86`, via an optional 2nd
+     arg now accepted by the internal `fail()` helper) — this is the file's
+     **first** exported pairing error, so callers should branch on `err.code`,
+     not on message text; `CONTESTED_ERROR`/`TAMPERED_ERROR` are deliberately
+     **not** retrofitted with a code in this change (neither is even exported
+     today — existing callers match on message text) — that's a separate,
+     later follow-up, not an oversight.
+
+**When `expectedCommit` is absent, there is no behavioural change on the
+shipped (link/typed-code) path** — both new checks are gated on
+`expectedCommit !== undefined`. (Earlier revisions of this doc claimed
+"byte-identical to today"; the `pair_reveal` handler was reordered to run the
+QR check before the pre-existing wire-commit check, so the *code path taken*
+changed even though the *observable behaviour* for `expectedCommit`-absent
+callers did not — the distinction matters if you're diffing control flow.)
+
+**The SAS is unchanged and still required.** These hooks authenticate the
+*key exchange*; they say nothing about the SAS step that follows, which the
+protocol still runs unconditionally. Skipping the SAS because a caller
+verified `expectedCommit` would be a caller-side product decision — out of
+scope for this crypto core, and not something this change endorses.
 
 ## Contested pairing is a fatal abort, by design — and not yet recoverable
 
