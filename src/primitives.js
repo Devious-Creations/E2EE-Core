@@ -250,6 +250,17 @@ export async function pbkdf2(password, salt, iterations, keyLength) {
  * working set than at 32 MiB (cache/TLB pressure). That extra cost per unit of
  * work is the memory-hardness earning its keep — it is charged to an attacker
  * too, and they cannot amortize it away.
+ *
+ * `asyncTick: 200` (noble's default is 10) is how many ms of block-mixing run
+ * between event-loop yields. The yield is not free: a consumer whose yield is
+ * a real macrotask (a timer, so UI work actually runs between chunks) pays a
+ * scheduler round-trip each time, 1–15 ms depending on the host. At tick=10
+ * that overhead dominates the derivation — measured 2026-08-02 at v3 params:
+ * tick=10 took 16.7 s of which only 0.7 s was scrypt (1077 yields, ~15 ms
+ * each); tick=200 took 0.55 s. Output is identical (the KAT test pins it);
+ * this is scheduling, not security. 200 ms still yields ~5×/s — enough for a
+ * progress bar and touch handling. Where the yield is a cheap microtask (e.g.
+ * plain Node), the tick value is close to irrelevant in both directions.
  * @param {string|Uint8Array} password
  * @param {Uint8Array} salt
  * @param {{ N: number, r: number, p: number, dkLen: number }} params
@@ -259,5 +270,5 @@ export async function pbkdf2(password, salt, iterations, keyLength) {
  */
 export async function scrypt(password, salt, { N, r, p, dkLen }, onProgress) {
   const { scryptAsync: _scryptAsync } = await import('@noble/hashes/scrypt.js');
-  return _scryptAsync(password, salt, { N, r, p, dkLen, onProgress });
+  return _scryptAsync(password, salt, { N, r, p, dkLen, onProgress, asyncTick: 200 });
 }
