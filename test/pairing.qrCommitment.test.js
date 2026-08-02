@@ -2,8 +2,11 @@
 // on top of src/pairing.js's committed X25519 + SAS handshake (board #233 step
 // 6, phase A): `onCommit` (initiator: hand the commitment to the caller so it
 // can be rendered into a QR) and `expectedCommit` (joiner: verify a
-// scanned/out-of-band commitment against BOTH the wire's pair_commit and the
-// independently re-hashed pair_reveal, aborting fatally on any mismatch).
+// scanned/out-of-band commitment against BOTH the wire's pair_commit — the
+// PRIMARY defence — and the independently re-hashed pair_reveal — defence in
+// depth — aborting fatally on any mismatch). Both are passed via a trailing
+// options bag: `initiatePairing(code, userId, onStateChange, { onCommit })`
+// / `joinPairing(code, userId, onStateChange, { expectedCommit })`.
 //
 // This file is additive — it does not touch pairing.test.js's pinned
 // contested-abort tripwire tests.
@@ -11,10 +14,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  createPairing,
-  QR_COMMITMENT_MISMATCH_ERROR,
-} from '../src/pairing.js';
+import { createPairing, QR_COMMITMENT_MISMATCH_ERROR } from '../src/pairing.js';
+import { pairing as pairingNamespace } from '../src/index.js';
 import { createMemoryTransportPair } from '../adapters/memoryTransport.js';
 import { createMemoryKeyStore } from '../adapters/memoryKeyStore.js';
 import * as primitives from '../src/primitives.js';
@@ -24,9 +25,20 @@ const UUID_B = '22222222-2222-4222-8222-222222222222';
 
 // A base64 string that decodes to exactly 32 bytes — satisfies decode32()'s
 // shape check for a commit/publicKey field without corresponding to any real
-// key material (the paths exercised here fail before that would matter).
+// key material.
 async function random32Base64() {
   return primitives.encodeBase64(await primitives.randomBytes(32));
+}
+
+// A REAL ephemeral keypair + its genuine commitment (sha256 of the raw public
+// key bytes, base64-encoded) — computed exactly the way pairing.js computes
+// `myCommit`. Used where a test needs to model a genuine forwarded
+// commitment/key pair rather than opaque random bytes.
+async function realKeyAndCommit() {
+  const kp = await primitives.generateKeypair();
+  const publicKeyB64 = await primitives.encodeBase64(kp.publicKey);
+  const commit = await primitives.encodeBase64(await primitives.sha256Bytes(kp.publicKey));
+  return { publicKeyB64, commit };
 }
 
 // A tracking Transport: records every event this endpoint SENDS (so a test can
@@ -60,7 +72,9 @@ test('onCommit: fires once on the initiator with base64(sha256(pk_I)), before an
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
 
   const commits = [];
-  const attempt = A.initiatePairing('WOLF-QR01', UUID_A, () => {}, (commit) => commits.push(commit));
+  const attempt = A.initiatePairing('WOLF-QR01', UUID_A, () => {}, {
+    onCommit: (commit) => commits.push(commit),
+  });
   await new Promise((r) => setTimeout(r, 20)); // let generateKeypair + myCommit settle
 
   assert.equal(commits.length, 1, 'onCommit fires exactly once');
@@ -77,6 +91,72 @@ test('onCommit: fires once on the initiator with base64(sha256(pk_I)), before an
   await assert.rejects(() => attempt, /Pairing cancelled/);
 });
 
+test('onCommit: the joiner never receives it (gated to role === initiator)', async () => {
+  const [tA, tB] = createMemoryTransportPair();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
+
+  const joinerCommits = [];
+  const joinP = B.joinPairing('WOLF-QR02', UUID_B, () => {}, {
+    onCommit: (c) => joinerCommits.push(c),
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  const initP = A.initiatePairing('WOLF-QR02', UUID_A, () => {});
+
+  await Promise.all([joinP, initP]);
+  assert.equal(
+    joinerCommits.length,
+    0,
+    'onCommit is initiator-only; passing it in the joiner options bag must never fire it',
+  );
+});
+
+test('onCommit: a throwing synchronous callback does not break the handshake', async () => {
+  const [tA, tB] = createMemoryTransportPair();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
+
+  const joinP = B.joinPairing('WOLF-QR03', UUID_B, () => {});
+  await new Promise((r) => setTimeout(r, 0));
+  const initP = A.initiatePairing('WOLF-QR03', UUID_A, () => {}, {
+    onCommit: () => {
+      throw new Error('caller QR-rendering bug');
+    },
+  });
+
+  const [rB, rA] = await Promise.all([joinP, initP]);
+  assert.equal(rA.sharedKey, rB.sharedKey, 'a throwing onCommit does not stop the handshake completing');
+});
+
+test('onCommit: a rejecting async callback does not crash the process or break the handshake', async () => {
+  const unhandled = [];
+  const onUnhandledRejection = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandledRejection);
+  try {
+    const [tA, tB] = createMemoryTransportPair();
+    const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
+    const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
+
+    const joinP = B.joinPairing('WOLF-QR04', UUID_B, () => {});
+    await new Promise((r) => setTimeout(r, 0));
+    const initP = A.initiatePairing('WOLF-QR04', UUID_A, () => {}, {
+      onCommit: async () => {
+        throw new Error('async QR render failed');
+      },
+    });
+
+    const [rB, rA] = await Promise.all([joinP, initP]);
+    assert.equal(rA.sharedKey, rB.sharedKey, 'a rejecting async onCommit does not stop the handshake completing');
+
+    // Give the rejected promise's microtask a turn — an unhandled rejection
+    // would already have fired the process-level event by now.
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(unhandled.length, 0, 'the async onCommit rejection never surfaces as an unhandled rejection');
+  } finally {
+    process.off('unhandledRejection', onUnhandledRejection);
+  }
+});
+
 test('QR path: matching expectedCommit completes the handshake exactly like the no-QR path', async () => {
   const [tA, tB] = createMemoryTransportPair();
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
@@ -88,10 +168,12 @@ test('QR path: matching expectedCommit completes the handshake exactly like the 
   const commitCaptured = new Promise((resolve) => {
     resolveCommit = resolve;
   });
-  const initP = A.initiatePairing('WOLF-QR02', UUID_A, () => {}, (commit) => resolveCommit(commit));
+  const initP = A.initiatePairing('WOLF-QR05', UUID_A, () => {}, {
+    onCommit: (commit) => resolveCommit(commit),
+  });
   const scannedCommit = await commitCaptured;
 
-  const joinP = B.joinPairing('WOLF-QR02', UUID_B, () => {}, scannedCommit);
+  const joinP = B.joinPairing('WOLF-QR05', UUID_B, () => {}, { expectedCommit: scannedCommit });
   const [rA, rB] = await Promise.all([initP, joinP]);
 
   // Same resolve shape/values as the plain (no expectedCommit) handshake.
@@ -105,14 +187,14 @@ test('QR path: matching expectedCommit completes the handshake exactly like the 
   assert.equal(rA.channelName, rB.channelName);
 });
 
-test('QR path: no expectedCommit and no onCommit — behavior unchanged, a normal pairing still succeeds', async () => {
+test('QR path: no expectedCommit and no onCommit — a normal pairing still succeeds', async () => {
   const [tA, tB] = createMemoryTransportPair();
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
   const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
 
-  const joinP = B.joinPairing('WOLF-QR03', UUID_B, () => {});
+  const joinP = B.joinPairing('WOLF-QR06', UUID_B, () => {});
   await new Promise((r) => setTimeout(r, 0));
-  const initP = A.initiatePairing('WOLF-QR03', UUID_A, () => {});
+  const initP = A.initiatePairing('WOLF-QR06', UUID_A, () => {});
 
   const [rB, rA] = await Promise.all([joinP, initP]);
   assert.equal(rA.sharedKey, rB.sharedKey);
@@ -124,10 +206,10 @@ test('QR path: wrong expectedCommit aborts at pair_commit, before pair_response 
   const B = createPairing({ keyStore: createMemoryKeyStore(), transport });
 
   const wrongExpected = await random32Base64();
-  const attempt = B.joinPairing('WOLF-QR04', UUID_B, () => {}, wrongExpected);
+  const attempt = B.joinPairing('WOLF-QR07', UUID_B, () => {}, { expectedCommit: wrongExpected });
   const rejection = assert.rejects(
     () => attempt,
-    (err) => err.message === QR_COMMITMENT_MISMATCH_ERROR,
+    (err) => err.message === QR_COMMITMENT_MISMATCH_ERROR && err.code === 'QR_COMMITMENT_MISMATCH',
   );
 
   await new Promise((r) => setTimeout(r, 20)); // let the joiner register its handlers
@@ -138,6 +220,14 @@ test('QR path: wrong expectedCommit aborts at pair_commit, before pair_response 
   const wireCommit = await random32Base64();
   transport.emit('pair_commit', { userId: UUID_A, commit: wireCommit });
 
+  try {
+    await attempt;
+    assert.fail('expected the handshake to reject');
+  } catch (err) {
+    assert.equal(err.message, QR_COMMITMENT_MISMATCH_ERROR);
+    assert.equal('sharedKey' in err, false, 'the rejection carries no sharedKey');
+    assert.equal('session' in err, false, 'the rejection carries no session');
+  }
   await rejection;
 
   assert.equal(
@@ -147,33 +237,46 @@ test('QR path: wrong expectedCommit aborts at pair_commit, before pair_response 
   );
 });
 
-test('QR path: a pair_reveal that does not hash to expectedCommit aborts before session derivation', async () => {
+test('QR path: a genuinely different revealed key that does not hash to expectedCommit aborts before session derivation', async () => {
   const transport = createTrackingTransport();
   const B = createPairing({ keyStore: createMemoryKeyStore(), transport });
 
-  // The scanned commitment. A substituting transport can pass THIS through
-  // verbatim as the wire pair_commit (so the pair_commit-stage check above
-  // passes) yet still reveal a DIFFERENT key at pair_reveal — that is exactly
-  // the case the independent, revealed-key re-hash must catch.
-  const expectedCommit = await random32Base64();
-  const attempt = B.joinPairing('WOLF-QR05', UUID_B, () => {}, expectedCommit);
+  // A real keypair + its genuine commitment — the "scanned QR" value.
+  const scanned = await realKeyAndCommit();
+  // A SECOND, different real keypair — what a substituting MITM reveals
+  // instead of the key the human actually scanned.
+  const substituted = await realKeyAndCommit();
+
+  const attempt = B.joinPairing('WOLF-QR08', UUID_B, () => {}, {
+    expectedCommit: scanned.commit,
+  });
   const rejection = assert.rejects(
     () => attempt,
-    (err) => err.message === QR_COMMITMENT_MISMATCH_ERROR,
+    (err) => err.message === QR_COMMITMENT_MISMATCH_ERROR && err.code === 'QR_COMMITMENT_MISMATCH',
   );
 
   await new Promise((r) => setTimeout(r, 20));
 
-  // Stage 1: the wire commit matches expectedCommit — passes the pair_commit
-  // check, locks partnerCommit, and (in a real run) sends pair_response.
-  transport.emit('pair_commit', { userId: UUID_A, commit: expectedCommit });
+  // Stage 1: the wire commit matches expectedCommit exactly (both are the
+  // real, genuine commitment of `scanned`'s keypair) — passes the
+  // pair_commit-stage gate, locks partnerCommit, and (in a real run) sends
+  // pair_response.
+  transport.emit('pair_commit', { userId: UUID_A, commit: scanned.commit });
   await new Promise((r) => setTimeout(r, 20));
 
-  // Stage 2: reveal a key that does NOT hash to expectedCommit — a
-  // substituting MITM presenting a key the human never scanned.
-  const substitutedKey = await random32Base64();
-  transport.emit('pair_reveal', { userId: UUID_A, publicKey: substitutedKey });
+  // Stage 2: reveal `substituted`'s REAL public key — a genuinely different,
+  // validly-formed key that does not hash to `scanned.commit`. Models an
+  // actual forwarded-then-substituted reveal, not just opaque random bytes.
+  transport.emit('pair_reveal', { userId: UUID_A, publicKey: substituted.publicKeyB64 });
 
+  try {
+    await attempt;
+    assert.fail('expected the handshake to reject');
+  } catch (err) {
+    assert.equal(err.message, QR_COMMITMENT_MISMATCH_ERROR);
+    assert.equal('sharedKey' in err, false, 'the rejection carries no sharedKey');
+    assert.equal('session' in err, false, 'the rejection carries no session');
+  }
   await rejection;
 
   assert.equal(
@@ -181,4 +284,79 @@ test('QR path: a pair_reveal that does not hash to expectedCommit aborts before 
     0,
     'no session/confirm is ever produced from the mismatched reveal',
   );
+});
+
+test('QR path: pair_reveal with no prior pair_commit is silently ignored — stays pending, nothing sent', async () => {
+  const transport = createTrackingTransport();
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  const expectedCommit = await random32Base64();
+  const attempt = B.joinPairing('WOLF-QR09', UUID_B, () => {}, { expectedCommit });
+  await new Promise((r) => setTimeout(r, 20));
+
+  const substitutedKey = await random32Base64();
+  transport.emit('pair_reveal', { userId: UUID_A, publicKey: substitutedKey });
+  await new Promise((r) => setTimeout(r, 20));
+
+  const PENDING = Symbol('pending');
+  const outcome = await Promise.race([
+    attempt.then(
+      () => 'resolved',
+      () => 'rejected',
+    ),
+    new Promise((r) => setTimeout(() => r(PENDING), 20)),
+  ]);
+  assert.equal(
+    outcome,
+    PENDING,
+    'a reveal before any commit is ignored (existing behaviour), not a fatal abort — the handshake is still pending',
+  );
+  assert.equal(transport.sent.length, 0, 'no messages sent in response to an out-of-order reveal');
+
+  // Cleanup: don't leave a live timer/interval running past this test.
+  B.cancelActiveHandshake();
+  await assert.rejects(() => attempt, /Pairing cancelled/);
+});
+
+test('expectedCommit validation: null is a programmer-error throw, not an attack error', async () => {
+  const transport = createTrackingTransport();
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  await assert.rejects(
+    () => B.joinPairing('WOLF-QR10', UUID_B, () => {}, { expectedCommit: null }),
+    (err) =>
+      err.message === '[pairing] options.expectedCommit must be a base64 string' &&
+      err.code === undefined &&
+      err.message !== QR_COMMITMENT_MISMATCH_ERROR,
+  );
+  assert.equal(transport.sent.length, 0, 'the handshake never even starts on a caller-typing bug');
+});
+
+test('expectedCommit validation: an empty string is a programmer-error throw, not an attack error', async () => {
+  const transport = createTrackingTransport();
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  await assert.rejects(
+    () => B.joinPairing('WOLF-QR11', UUID_B, () => {}, { expectedCommit: '' }),
+    (err) =>
+      err.message === '[pairing] options.expectedCommit must be a base64 string' &&
+      err.code === undefined &&
+      err.message !== QR_COMMITMENT_MISMATCH_ERROR,
+  );
+  assert.equal(transport.sent.length, 0);
+});
+
+test('onCommit validation: a non-function value is a programmer-error throw', async () => {
+  const transport = createTrackingTransport();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  await assert.rejects(
+    () => A.initiatePairing('WOLF-QR12', UUID_A, () => {}, { onCommit: 'not-a-function' }),
+    /\[pairing\] options\.onCommit must be a function/,
+  );
+  assert.equal(transport.sent.length, 0, 'a wrong-typed onCommit must not silently proceed unauthenticated');
+});
+
+test('QR_COMMITMENT_MISMATCH_ERROR is reachable via the package index (protects against an index refactor dropping it)', () => {
+  assert.equal(pairingNamespace.QR_COMMITMENT_MISMATCH_ERROR, QR_COMMITMENT_MISMATCH_ERROR);
 });
