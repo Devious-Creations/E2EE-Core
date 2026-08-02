@@ -62,15 +62,27 @@ export const PAIRING_TIMEOUT_MS = 120_000;
 const PROTO = 'e2ee-core-pair-v2';
 const REPEAT_MS = 2000;
 
-const CONTESTED_ERROR =
+// Exported error messages — the message text is for humans (a UI string);
+// each has a stable, machine-readable err.code (below, attached at every throw
+// site via fail()) for callers to branch on instead of matching on message
+// text, which silently breaks if the copy is ever reworded. Message text is
+// UNCHANGED from before these were exported — existing callers that still
+// match on message text keep working.
+/** @type {string} */
+export const CONTESTED_ERROR =
   'Pairing contested — more than one device answered this code. Generate a new code and try again.';
-const TAMPERED_ERROR =
+/** @type {string} */
+export const TAMPERED_ERROR =
   'Pairing aborted — the key exchange failed verification. Generate a new code and try again.';
+
+/** @type {string} */
+export const CONTESTED_CODE = 'CONTESTED';
+/** @type {string} */
+export const TAMPERED_CODE = 'TAMPERED';
 
 // Distinct, exported error message for an out-of-band (QR-delivered) commitment
 // mismatch — the caller must be able to tell this apart from CONTESTED_ERROR/
-// TAMPERED_ERROR (neither of which is exported: today's callers only match on
-// message text) so it can render a louder UI: this is not "a duplicate device
+// TAMPERED_ERROR so it can render a louder UI: this is not "a duplicate device
 // answered" or "the wire failed verification", it is "the thing that scanned
 // the QR is not who's on the other end of this transport at all".
 /** @type {string} */
@@ -79,10 +91,9 @@ export const QR_COMMITMENT_MISMATCH_ERROR =
 
 // A stable, machine-readable code on top of the message above — the message
 // text is for humans (a UI string), the code is for callers to branch on.
-// This is the first exported pairing error in this file, so it sets the
-// precedent for future ones (CONTESTED_ERROR/TAMPERED_ERROR are NOT retrofitted
-// with a code in this change — that's a deliberate, separate follow-up, not an
-// oversight).
+// This was the first exported pairing error in this file, setting the
+// precedent (CONTESTED_ERROR/TAMPERED_ERROR are now retrofitted with codes
+// the same way — CONTESTED_CODE/TAMPERED_CODE above).
 export const QR_COMMITMENT_MISMATCH_CODE = 'QR_COMMITMENT_MISMATCH';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -382,7 +393,7 @@ export function createPairing({ keyStore, transport } = {}) {
           return true;
         }
         if (partnerId !== id) {
-          fail(CONTESTED_ERROR);
+          fail(CONTESTED_ERROR, CONTESTED_CODE);
           return false;
         }
         return true;
@@ -432,14 +443,14 @@ export function createPairing({ keyStore, transport } = {}) {
         if (settled || !payload) return;
         if (role === 'initiator') {
           // We are the only initiator on this code — fail closed.
-          if (payload.userId !== userId) fail(CONTESTED_ERROR);
+          if (payload.userId !== userId) fail(CONTESTED_ERROR, CONTESTED_CODE);
           return;
         }
         if (!lockOrVerifyPartner(payload.userId)) return;
         const commitBytes = await decode32(payload.commit);
         if (settled) return;
         if (!commitBytes) {
-          fail(TAMPERED_ERROR);
+          fail(TAMPERED_ERROR, TAMPERED_CODE);
           return;
         }
         if (partnerCommit === null) {
@@ -475,7 +486,7 @@ export function createPairing({ keyStore, transport } = {}) {
           // Repeat our response until the initiator reveals its key.
           startRepeat(() => send('pair_response', { publicKey: myPublicKey }));
         } else if (partnerCommit !== payload.commit) {
-          fail(CONTESTED_ERROR);
+          fail(CONTESTED_ERROR, CONTESTED_CODE);
         }
         // Duplicate commit (initiator's repeat loop) — already responding.
       });
@@ -484,13 +495,13 @@ export function createPairing({ keyStore, transport } = {}) {
         if (settled || !payload) return;
         if (role === 'joiner') {
           // A second joiner is answering the same code — fail closed.
-          if (payload.userId !== userId) fail(CONTESTED_ERROR);
+          if (payload.userId !== userId) fail(CONTESTED_ERROR, CONTESTED_CODE);
           return;
         }
         if (!lockOrVerifyPartner(payload.userId)) return;
         if (partnerPublicKey !== null) {
           if (payload.publicKey !== partnerPublicKey) {
-            fail(CONTESTED_ERROR);
+            fail(CONTESTED_ERROR, CONTESTED_CODE);
           } else {
             // Duplicate response — they missed our reveal; resend it.
             send('pair_reveal', { publicKey: myPublicKey });
@@ -500,7 +511,7 @@ export function createPairing({ keyStore, transport } = {}) {
         const pkBytes = await decode32(payload.publicKey);
         if (settled) return;
         if (!pkBytes) {
-          fail(TAMPERED_ERROR);
+          fail(TAMPERED_ERROR, TAMPERED_CODE);
           return;
         }
         partnerPublicKey = payload.publicKey;
@@ -509,7 +520,7 @@ export function createPairing({ keyStore, transport } = {}) {
         try {
           session = await deriveSession(userId, partnerId, myPublicKey, partnerPublicKey);
         } catch {
-          fail(TAMPERED_ERROR);
+          fail(TAMPERED_ERROR, TAMPERED_CODE);
           return;
         }
         if (settled) return;
@@ -521,13 +532,13 @@ export function createPairing({ keyStore, transport } = {}) {
         if (!lockOrVerifyPartner(payload.userId)) return;
         if (partnerCommit === null) return; // reveal before commit — ignore
         if (partnerPublicKey !== null) {
-          if (payload.publicKey !== partnerPublicKey) fail(CONTESTED_ERROR);
+          if (payload.publicKey !== partnerPublicKey) fail(CONTESTED_ERROR, CONTESTED_CODE);
           return; // duplicate reveal — confirm loop already running
         }
         const pkBytes = await decode32(payload.publicKey);
         if (settled) return;
         if (!pkBytes) {
-          fail(TAMPERED_ERROR);
+          fail(TAMPERED_ERROR, TAMPERED_CODE);
           return;
         }
         const revealHash = await primitives.sha256Bytes(pkBytes);
@@ -558,14 +569,14 @@ export function createPairing({ keyStore, transport } = {}) {
         const commitBytes = await decode32(partnerCommit);
         if (settled) return;
         if (!commitBytes || !primitives.timingSafeEqual(revealHash, commitBytes)) {
-          fail(TAMPERED_ERROR);
+          fail(TAMPERED_ERROR, TAMPERED_CODE);
           return;
         }
         partnerPublicKey = payload.publicKey;
         try {
           session = await deriveSession(partnerId, userId, partnerPublicKey, myPublicKey);
         } catch {
-          fail(TAMPERED_ERROR);
+          fail(TAMPERED_ERROR, TAMPERED_CODE);
           return;
         }
         if (settled) return;
@@ -582,7 +593,7 @@ export function createPairing({ keyStore, transport } = {}) {
         const ok = await verifyConfirm(payload, senderRole);
         if (settled) return;
         if (!ok) {
-          fail(TAMPERED_ERROR);
+          fail(TAMPERED_ERROR, TAMPERED_CODE);
           return;
         }
         if (role === 'initiator') {

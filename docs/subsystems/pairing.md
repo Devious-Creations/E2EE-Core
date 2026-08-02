@@ -1,4 +1,4 @@
-> **Verified against:** `70dd6a0` · 2026-08-02 · by fable (board #233 step 6 phase A)
+> **Verified against:** `b6bf6e0` · 2026-08-02 · by coder (board #288)
 
 # Pairing — the X25519 + SAS handshake
 
@@ -119,16 +119,18 @@ a loud, immediate rejection instead.
      or bypassed** — it is not the primary mechanism and must not be relied on
      alone.
   3. Either mismatch is a hard, fatal, non-recoverable abort with the new
-     `QR_COMMITMENT_MISMATCH_ERROR` message (`src/pairing.js:70-78`) — no
+     `QR_COMMITMENT_MISMATCH_ERROR` message (`src/pairing.js:88-90`) — no
      retry, no fallback path, no session ever derived, no `sharedKey` ever
      returned. The thrown `Error` also carries `err.code ===
-     'QR_COMMITMENT_MISMATCH'` (`src/pairing.js:80-86`, via an optional 2nd
-     arg now accepted by the internal `fail()` helper) — this is the file's
-     **first** exported pairing error, so callers should branch on `err.code`,
-     not on message text; `CONTESTED_ERROR`/`TAMPERED_ERROR` are deliberately
-     **not** retrofitted with a code in this change (neither is even exported
-     today — existing callers match on message text) — that's a separate,
-     later follow-up, not an oversight.
+     'QR_COMMITMENT_MISMATCH'` (`src/pairing.js:92-97`, via an optional 2nd
+     arg accepted by the internal `fail()` helper) — this was the file's
+     **first** exported pairing error, and set the precedent: `CONTESTED_ERROR`
+     and `TAMPERED_ERROR` are now exported the same way, each with its own
+     stable `err.code` (`CONTESTED_CODE = 'CONTESTED'`, `TAMPERED_CODE =
+     'TAMPERED'`, `src/pairing.js:65-81`), attached at every `fail(...)` call
+     site that throws them. Callers should branch on `err.code`, not on
+     message text, for all three — message text itself is unchanged, so
+     existing callers still matching on it are unaffected (board #288).
 
 **When `expectedCommit` is absent, there is no behavioural change on the
 shipped (link/typed-code) path** — both new checks are gated on
@@ -159,8 +161,10 @@ revives, for the lifetime of that `performHandshake` call:**
    locked (`src/pairing.js:360-364`, the branch that is NOT the same-key
    "resend" case).
 
-All three call `fail(CONTESTED_ERROR)` (`src/pairing.js:65-66, 236-241`),
-which sets the closure-scoped `settled` flag, tears the handshake down
+All three call `fail(CONTESTED_ERROR, CONTESTED_CODE)` (`src/pairing.js:72-73,
+79`, `348` for `fail()` itself), so the rejected error carries both the
+message and `err.code === 'CONTESTED'` (board #288). Calling `fail()` also
+sets the closure-scoped `settled` flag, tears the handshake down
 (`cleanup()` — clears timers and closes the transport), and rejects the
 promise. Every event handler in `performHandshake` checks `settled` at its
 top or via `lockOrVerifyPartner`'s own guard, so a message arriving after
@@ -216,7 +220,8 @@ constant-time comparison.** The joiner verifies
 `sha256(revealed_pk) == commit` via `primitives.timingSafeEqual`
 (`src/pairing.js:404-410`) before deriving a session from it — an initiator
 that reveals a key different from what it committed to is treated as
-tampering (`TAMPERED_ERROR`), not as a protocol variance.
+tampering (`TAMPERED_ERROR`, `err.code === 'TAMPERED'`), not as a protocol
+variance.
 
 **Key confirmation is bound to role and both identities.** `confirmMac`
 (`src/pairing.js:308-311`) HMACs `role|initiatorId|joinerId` under the
