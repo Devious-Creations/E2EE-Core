@@ -67,6 +67,16 @@ const CONTESTED_ERROR =
 const TAMPERED_ERROR =
   'Pairing aborted — the key exchange failed verification. Generate a new code and try again.';
 
+// Distinct, exported error message for an out-of-band (QR-delivered) commitment
+// mismatch — the caller must be able to tell this apart from CONTESTED_ERROR/
+// TAMPERED_ERROR (neither of which is exported: today's callers only match on
+// message text) so it can render a louder UI: this is not "a duplicate device
+// answered" or "the wire failed verification", it is "the thing that scanned
+// the QR is not who's on the other end of this transport at all".
+/** @type {string} */
+export const QR_COMMITMENT_MISMATCH_ERROR =
+  'Pairing aborted — the scanned code does not match this device. Do not proceed; scan the correct code.';
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** @type {string[]} Memorable 4-letter words for pairing code generation. */
@@ -160,10 +170,14 @@ export function createPairing({ keyStore, transport } = {}) {
    * @param {string} code
    * @param {string} userId
    * @param {(state: string) => void} onStateChange
+   * @param {(commit: string) => void} [onCommit] - optional; called once with
+   *   the base64 commitment (sha256(pk_I)) as soon as it exists, so the caller
+   *   can render it into a QR for out-of-band delivery to the joiner. Never
+   *   allowed to throw into or stall the handshake — see performHandshake.
    * @returns {Promise<{ role: string, partnerId: string, sharedKey: string, channelName: string, sas: string }>}
    */
-  function initiatePairing(code, userId, onStateChange) {
-    return performHandshake(code, userId, 'initiator', onStateChange);
+  function initiatePairing(code, userId, onStateChange, onCommit) {
+    return performHandshake(code, userId, 'initiator', onStateChange, onCommit, undefined);
   }
 
   /**
@@ -172,13 +186,20 @@ export function createPairing({ keyStore, transport } = {}) {
    * @param {string} code
    * @param {string} userId
    * @param {(state: string) => void} onStateChange
+   * @param {string} [expectedCommit] - optional base64 commitment obtained
+   *   out-of-band (e.g. scanned from the initiator's QR). When provided, the
+   *   wire's `pair_commit` is checked against it (abort before responding on a
+   *   mismatch) and the `pair_reveal`'d key is independently re-hashed and
+   *   checked against it too (abort before deriving a session) — both are
+   *   fatal, non-recoverable `QR_COMMITMENT_MISMATCH_ERROR` aborts. Omitted:
+   *   behavior is byte-identical to today (the link/typed-code path).
    * @returns {Promise<{ role: string, partnerId: string, sharedKey: string, channelName: string, sas: string }>}
    */
-  function joinPairing(code, userId, onStateChange) {
-    return performHandshake(code, userId, 'joiner', onStateChange);
+  function joinPairing(code, userId, onStateChange, expectedCommit) {
+    return performHandshake(code, userId, 'joiner', onStateChange, undefined, expectedCommit);
   }
 
-  async function performHandshake(code, userId, role, onStateChange) {
+  async function performHandshake(code, userId, role, onStateChange, onCommit, expectedCommit) {
     if (!transport || typeof transport.send !== 'function' || typeof transport.on !== 'function') {
       throw new Error('[pairing] a handshake requires a Transport { send, on, close }');
     }
@@ -200,6 +221,21 @@ export function createPairing({ keyStore, transport } = {}) {
     const myCommit = await primitives.encodeBase64(
       await primitives.sha256Bytes(await primitives.decodeBase64(myPublicKey)),
     );
+
+    // Hand the commitment to the caller as soon as it exists, so it can be
+    // rendered into a QR for out-of-band delivery — this fires once, on the
+    // INITIATOR path only, before the pair_commit broadcast loop starts below.
+    // A throwing or slow callback must never break or stall the handshake;
+    // onStateChange (above/below) gets no such guard today, so this is a
+    // deliberately stricter treatment for the new hook, not a mirror of it.
+    if (role === 'initiator' && typeof onCommit === 'function') {
+      try {
+        onCommit(myCommit);
+      } catch {
+        // Caller's QR-rendering callback misbehaved — never let that abort or
+        // stall a pairing attempt that is otherwise fine.
+      }
+    }
 
     // Decode a base64 field that must be exactly 32 bytes; null if malformed.
     async function decode32(b64) {
@@ -340,6 +376,15 @@ export function createPairing({ keyStore, transport } = {}) {
           return;
         }
         if (partnerCommit === null) {
+          // Out-of-band commitment check (QR path): if the caller supplied
+          // expectedCommit, the wire's commit must match it BEFORE we send
+          // pair_response — otherwise we'd be responding to whoever holds the
+          // untrusted transport, not the device the human actually scanned.
+          // Fatal, fail-fast: no response leaks to an impostor.
+          if (expectedCommit !== undefined && payload.commit !== expectedCommit) {
+            fail(QR_COMMITMENT_MISMATCH_ERROR);
+            return;
+          }
           partnerCommit = payload.commit;
           // Repeat our response until the initiator reveals its key.
           startRepeat(() => send('pair_response', { publicKey: myPublicKey }));
@@ -399,11 +444,27 @@ export function createPairing({ keyStore, transport } = {}) {
           fail(TAMPERED_ERROR);
           return;
         }
+        const revealHash = await primitives.sha256Bytes(pkBytes);
+        if (settled) return;
+        // Out-of-band commitment check (QR path) FIRST, independent of the
+        // wire's pair_commit: re-verify the revealed key's hash against
+        // expectedCommit directly, never against the already-stored
+        // partnerCommit (which travelled over the same untrusted transport).
+        // A MITM that substitutes both pair_commit and pair_reveal together —
+        // consistently with each other — would still pass the wire-commit
+        // check below, so this must run and can never be skipped in favour of
+        // it. Fatal, before any session/key material exists.
+        if (expectedCommit !== undefined) {
+          const expectedCommitBytes = await decode32(expectedCommit);
+          if (settled) return;
+          if (!expectedCommitBytes || !primitives.timingSafeEqual(revealHash, expectedCommitBytes)) {
+            fail(QR_COMMITMENT_MISMATCH_ERROR);
+            return;
+          }
+        }
         // The revealed key must match the commitment sent before our key —
         // otherwise the initiator chose its key after seeing ours.
         const commitBytes = await decode32(partnerCommit);
-        const revealHash = await primitives.sha256Bytes(pkBytes);
-        if (settled) return;
         if (!commitBytes || !primitives.timingSafeEqual(revealHash, commitBytes)) {
           fail(TAMPERED_ERROR);
           return;

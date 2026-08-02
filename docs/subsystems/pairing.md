@@ -1,4 +1,4 @@
-> **Verified against:** `e2235f5` · 2026-07-30 · by coder (#142 backfill)
+> **Verified against:** branch `feat/qr-commitment-hooks` · 2026-08-02 · by coder (board #233 step 6 phase A)
 
 # Pairing — the X25519 + SAS handshake
 
@@ -20,6 +20,61 @@ implies no machine-in-the-middle. The five-step protocol
 specifically so a MITM cannot grind its own keypair after seeing the other
 side's public key to force a matching SAS (`src/pairing.js:24-28,
 288-291`).
+
+## Out-of-band commitment delivery (QR path) — board #233
+
+The wire commit alone cannot authenticate anything: it travels over the same
+untrusted `Transport` as everything else, so a MITM sitting between the two
+devices simply substitutes its own `pair_commit` **and** its own matching
+`pair_reveal` together — the commitment only ever stopped SAS-*grinding*
+(picking a key after seeing the other side's), never impersonation. Two
+hooks let a caller deliver that same commitment through a channel a MITM
+cannot reach — a QR code scanned camera-to-screen between the two devices —
+so the app can authenticate the pairing *before* the SAS step even runs.
+Neither hook changes the wire protocol, message shapes, the transcript, or
+the SAS; they are pure additions gated on the new parameters being present.
+
+- **`onCommit`** (initiator, optional 4th arg to `initiatePairing`,
+  `src/pairing.js:179-180`): called once, synchronously, with the base64
+  commitment (`sha256(pk_I)`) the instant it's computed (`src/pairing.js:
+  231-236`) — before the `pair_commit` broadcast loop starts — so the caller
+  can render it into a QR. A throwing or slow callback is caught and can never
+  break or stall the handshake (`try/catch` around the call,
+  `src/pairing.js:232-236`); note `onStateChange` itself gets no such guard
+  today, so this is a deliberately *stricter* treatment for the new hook, not
+  a mirror of an existing one.
+- **`expectedCommit`** (joiner, optional 4th arg to `joinPairing`,
+  `src/pairing.js:198-199`): the base64 commitment obtained out-of-band (e.g.
+  scanned from the initiator's QR). When present:
+  1. On `pair_commit`, the wire value must equal `expectedCommit` **before**
+     `pair_response` is sent (`src/pairing.js:378-388`) — fail-fast, so an
+     impostor holding the transport never even gets a response.
+  2. On `pair_reveal`, the revealed key is re-hashed and checked against
+     `expectedCommit` **directly** — never against the already-stored,
+     wire-derived `partnerCommit` (`src/pairing.js:447-462`, checked *before*
+     the pre-existing wire-commit check at `src/pairing.js:463-467`). This is
+     the point that actually matters: a MITM that substitutes both halves
+     consistently with *each other* still passes the ordinary wire-commit
+     check, so `expectedCommit` must be verified against the **revealed key
+     itself**, not merely against whatever commit value arrived over the wire.
+  3. Either mismatch is a hard, fatal, non-recoverable abort with the new
+     `QR_COMMITMENT_MISMATCH_ERROR` (`src/pairing.js:71-77`) — no retry, no
+     fallback path, no session ever derived, no `sharedKey` ever returned.
+     It is deliberately distinguishable from `CONTESTED_ERROR`/
+     `TAMPERED_ERROR` (neither of which is actually exported — callers
+     today match on message text) so the app can render a louder,
+     different UI for "the thing you scanned isn't this device" than for an
+     ordinary contested-code or wire-tamper abort.
+
+**When `expectedCommit` is absent, behavior is byte-identical to today** — the
+link/typed-code path is untouched; both new checks are gated on
+`expectedCommit !== undefined`.
+
+**The SAS is unchanged and still required.** These hooks authenticate the
+*key exchange*; they say nothing about the SAS step that follows, which the
+protocol still runs unconditionally. Skipping the SAS because a caller
+verified `expectedCommit` would be a caller-side product decision — out of
+scope for this crypto core, and not something this change endorses.
 
 ## Contested pairing is a fatal abort, by design — and not yet recoverable
 
