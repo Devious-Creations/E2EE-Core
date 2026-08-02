@@ -1,4 +1,4 @@
-> **Verified against:** branch `feat/qr-commitment-hooks` · 2026-08-02 · by coder (board #233 step 6 phase A)
+> **Verified against:** `70dd6a0` · 2026-08-02 · by fable (board #233 step 6 phase A)
 
 # Pairing — the X25519 + SAS handshake
 
