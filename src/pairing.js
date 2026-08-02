@@ -83,7 +83,7 @@ export const QR_COMMITMENT_MISMATCH_ERROR =
 // precedent for future ones (CONTESTED_ERROR/TAMPERED_ERROR are NOT retrofitted
 // with a code in this change — that's a deliberate, separate follow-up, not an
 // oversight).
-const QR_COMMITMENT_MISMATCH_CODE = 'QR_COMMITMENT_MISMATCH';
+export const QR_COMMITMENT_MISMATCH_CODE = 'QR_COMMITMENT_MISMATCH';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -221,21 +221,40 @@ export function createPairing({ keyStore, transport } = {}) {
   }
 
   async function performHandshake(code, userId, role, onStateChange, options = {}) {
-    const { onCommit, expectedCommit } = options;
+    const { onCommit, expectedCommit } = options ?? {};
+    // An unknown key is almost always a typo (`expectedCommmit`), and silently
+    // ignoring it reads as "no verification requested" — i.e. the handshake
+    // runs unauthenticated. That is the same silent-fail-open class the
+    // validation below closes, so reject it rather than guess the intent.
+    for (const key of Object.keys(options ?? {})) {
+      if (key !== 'onCommit' && key !== 'expectedCommit') {
+        throw new Error(`[pairing] unknown option: ${key}`);
+      }
+    }
     // Validate the two new hooks BEFORE anything else runs. Both slots used to
     // fail OPEN: a wrong-typed onCommit was silently ignored (QR never
     // rendered, handshake proceeds unauthenticated with no signal to the
     // caller) and a wrong-typed expectedCommit (e.g. a `null` from a caller's
     // `useState(null)`) would previously have been compared as a value and
     // could render an attack warning for what is a programmer bug. Both are
-    // now a loud, immediate, synchronous throw — a caller wiring bug must
-    // never be indistinguishable from "the handshake ran and decided
-    // something was fine" or from "a MITM was detected".
+    // now rejected immediately, before any transport activity or key
+    // generation — a caller wiring bug must never be indistinguishable from
+    // "the handshake ran and decided something was fine" or from "a MITM was
+    // detected". (performHandshake is async, so this surfaces as a rejected
+    // promise, not a synchronous throw: callers must await or .catch it.)
     if (onCommit !== undefined && typeof onCommit !== 'function') {
       throw new Error('[pairing] options.onCommit must be a function');
     }
-    if (expectedCommit !== undefined && (typeof expectedCommit !== 'string' || expectedCommit === '')) {
-      throw new Error('[pairing] options.expectedCommit must be a base64 string');
+    // Shape-check the digest itself, not merely "a non-empty string". Anything
+    // that is not a base64-encoded 32 bytes cannot be a commitment, and letting
+    // it through means the caller's own encoding bug (base64url from a QR
+    // round-trip, a truncated value) surfaces to the USER as "the scanned code
+    // does not match this device" — an attack warning for a wiring mistake.
+    if (
+      expectedCommit !== undefined &&
+      (typeof expectedCommit !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(expectedCommit))
+    ) {
+      throw new Error('[pairing] options.expectedCommit must be a base64-encoded 32-byte digest');
     }
 
     if (!transport || typeof transport.send !== 'function' || typeof transport.on !== 'function') {

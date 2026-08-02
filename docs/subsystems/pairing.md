@@ -48,22 +48,28 @@ await pairing.joinPairing(code, userId, onStateChange, { expectedCommit });
 ```
 
 (`src/pairing.js:193-221`, threaded into `performHandshake(code, userId, role,
-onStateChange, options)` at `src/pairing.js:223-224`.) This package has not
-been pinned by `Smaddle-App` at the time of this change, so the API was still
-free to move — see `CLAUDE.md`'s "pinned to an exact commit" note for why that
-window closes once the app bumps its pin.
+onStateChange, options)` at `src/pairing.js:223-224`.) Consumers pin this
+package to an exact commit, so no released consumer used these hooks yet when
+they were introduced — the API was still free to move. That window closes the
+moment a consumer bumps its pin to a commit containing them.
 
 **Both options are validated up front, before anything else runs**
 (`src/pairing.js:224-239`): `onCommit` (if present) must be a function,
-`expectedCommit` (if present) must be a non-empty string, or
-`performHandshake` throws synchronously. Before this validation existed, a
+`expectedCommit` (if present) must be a base64-encoded 32-byte digest (shape
+checked, so a base64url or truncated value from a QR round-trip is the
+caller's bug, not a user-facing attack warning), and an unrecognised option
+key is rejected outright (a typo like `expectedCommmit` would otherwise read
+as "no verification requested"). `performHandshake` is `async`, so these
+surface as an immediate promise REJECTION — before any transport activity or
+key generation — not as a synchronous throw; callers must `await` or
+`.catch`. Before this validation existed, a
 wrong-typed `onCommit` (e.g. a string) was silently ignored — the QR was
 never rendered and the handshake proceeded, unauthenticated, with no signal
 to the caller that anything was wrong — and a wrong-typed `expectedCommit`
 (e.g. `null`, the natural initial value of a caller's `useState(null)`, or
 `''`) would have been carried into the mismatch checks below and could
 render an attack warning for what is actually a programmer bug. Both are now
-a loud, immediate, synchronous throw instead.
+a loud, immediate rejection instead.
 
 - **`onCommit`** (`src/pairing.js:263-284`): called once with the base64
   commitment (`sha256(pk_I)`) the instant it's computed, on the initiator

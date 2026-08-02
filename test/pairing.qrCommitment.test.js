@@ -325,7 +325,7 @@ test('expectedCommit validation: null is a programmer-error throw, not an attack
   await assert.rejects(
     () => B.joinPairing('WOLF-QR10', UUID_B, () => {}, { expectedCommit: null }),
     (err) =>
-      err.message === '[pairing] options.expectedCommit must be a base64 string' &&
+      err.message === '[pairing] options.expectedCommit must be a base64-encoded 32-byte digest' &&
       err.code === undefined &&
       err.message !== QR_COMMITMENT_MISMATCH_ERROR,
   );
@@ -339,7 +339,7 @@ test('expectedCommit validation: an empty string is a programmer-error throw, no
   await assert.rejects(
     () => B.joinPairing('WOLF-QR11', UUID_B, () => {}, { expectedCommit: '' }),
     (err) =>
-      err.message === '[pairing] options.expectedCommit must be a base64 string' &&
+      err.message === '[pairing] options.expectedCommit must be a base64-encoded 32-byte digest' &&
       err.code === undefined &&
       err.message !== QR_COMMITMENT_MISMATCH_ERROR,
   );
@@ -359,4 +359,78 @@ test('onCommit validation: a non-function value is a programmer-error throw', as
 
 test('QR_COMMITMENT_MISMATCH_ERROR is reachable via the package index (protects against an index refactor dropping it)', () => {
   assert.equal(pairingNamespace.QR_COMMITMENT_MISMATCH_ERROR, QR_COMMITMENT_MISMATCH_ERROR);
+});
+
+// Tripwire for the byte-compare at the commit-stage gate (adversarial review
+// finding 5 / M2). `expectedCommit` round-trips through a QR code, and QR
+// encoders routinely re-encode base64: the final data character of a 32-byte
+// digest carries two bits that decode() ignores, so two DIFFERENT strings can
+// decode to the SAME 32 bytes. A string comparison there would abort an honest
+// in-person pairing with a "someone may be intercepting" warning. If anyone
+// reverts the gate to `payload.commit !== expectedCommit`, this test fails.
+test('QR path: a byte-equivalent re-encoding of the commitment still completes', async () => {
+  const [tA, tB] = createMemoryTransportPair();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
+
+  let resolveCommit;
+  const commitCaptured = new Promise((resolve) => {
+    resolveCommit = resolve;
+  });
+  const initP = A.initiatePairing('WOLF-QR10', UUID_A, () => {}, {
+    onCommit: (commit) => resolveCommit(commit),
+  });
+  const scannedCommit = await commitCaptured;
+
+  // Flip the lowest (ignored) bit of the last data character.
+  const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const lastIdx = scannedCommit.length - 2; // -1 is the '=' pad
+  const variantChar = ALPHABET[ALPHABET.indexOf(scannedCommit[lastIdx]) ^ 1];
+  const reEncoded = scannedCommit.slice(0, lastIdx) + variantChar + '=';
+
+  assert.notEqual(reEncoded, scannedCommit, 'the variant must be a different string');
+  assert.deepEqual(
+    Array.from(await primitives.decodeBase64(reEncoded)),
+    Array.from(await primitives.decodeBase64(scannedCommit)),
+    'the variant must decode to the identical 32 bytes',
+  );
+
+  const joinP = B.joinPairing('WOLF-QR10', UUID_B, () => {}, { expectedCommit: reEncoded });
+  const [rA, rB] = await Promise.all([initP, joinP]);
+  assert.equal(rA.sharedKey, rB.sharedKey);
+  assert.equal(rA.sas, rB.sas);
+});
+
+// Validation tripwires for the stricter expectedCommit shape check and the
+// unknown-option guard (review findings M1 and the options-bag footgun): a
+// caller's wiring bug must reject as a PROGRAMMER error, never surface to the
+// user as QR_COMMITMENT_MISMATCH ("someone may be intercepting").
+test('QR path: a malformed expectedCommit rejects as a caller error, not an attack', async () => {
+  for (const bad of ['not-base64!!', 'aGVsbG8', 'AAAA']) {
+    const [, tB] = createMemoryTransportPair();
+    const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
+    await assert.rejects(
+      B.joinPairing('WOLF-QR11', UUID_B, () => {}, { expectedCommit: bad }),
+      (err) => {
+        assert.match(err.message, /options\.expectedCommit/);
+        assert.notEqual(err.message, QR_COMMITMENT_MISMATCH_ERROR);
+        assert.equal(err.code, undefined);
+        return true;
+      },
+      `expected a caller error for ${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test('QR path: a misspelled option key rejects instead of silently skipping verification', async () => {
+  const [, tB] = createMemoryTransportPair();
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
+  await assert.rejects(
+    B.joinPairing('WOLF-QR12', UUID_B, () => {}, { expectedCommmit: await random32Base64() }),
+    /unknown option: expectedCommmit/,
+  );
+});
+
+test('QR path: the machine-readable code constant is exported from the package entry point', () => {
+  assert.equal(pairingNamespace.QR_COMMITMENT_MISMATCH_CODE, 'QR_COMMITMENT_MISMATCH');
 });
