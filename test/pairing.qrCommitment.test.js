@@ -20,6 +20,24 @@ import { createMemoryTransportPair } from '../adapters/memoryTransport.js';
 import { createMemoryKeyStore } from '../adapters/memoryKeyStore.js';
 import * as primitives from '../src/primitives.js';
 
+// Poll until `predicate()` is truthy. CI runners are far slower than a dev
+// machine — an X25519 keypair generation that takes ~2ms locally can take
+// hundreds of ms on a shared runner — so a fixed sleep is a flake waiting to
+// happen (it produced exactly that on Node 20 CI). Wait for the CONDITION
+// instead, with a generous ceiling.
+async function waitFor(predicate, what = 'condition', timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await predicate()) return;
+    if (Date.now() > deadline) throw new Error(`waitFor timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+// The joiner has registered its inbound handlers and is ready to be driven.
+const joinerReady = (transport) =>
+  waitFor(() => transport.handlers.has('pair_commit'), 'the joiner to register its handlers');
+
 const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_B = '22222222-2222-4222-8222-222222222222';
 
@@ -51,6 +69,7 @@ function createTrackingTransport() {
   const sent = [];
   return {
     sent,
+    handlers,
     send(event, payload) {
       sent.push({ event, payload });
     },
@@ -75,19 +94,24 @@ test('onCommit: fires once on the initiator with base64(sha256(pk_I)), before an
   const attempt = A.initiatePairing('WOLF-QR01', UUID_A, () => {}, {
     onCommit: (commit) => commits.push(commit),
   });
-  await new Promise((r) => setTimeout(r, 20)); // let generateKeypair + myCommit settle
+  await waitFor(() => commits.length > 0, 'onCommit to fire');
 
-  assert.equal(commits.length, 1, 'onCommit fires exactly once');
-  const decoded = await primitives.decodeBase64(commits[0]);
-  assert.equal(decoded.length, 32, 'the commit is a base64-encoded 32-byte sha256 digest');
+  try {
+    assert.equal(commits.length, 1, 'onCommit fires exactly once');
+    const decoded = await primitives.decodeBase64(commits[0]);
+    assert.equal(decoded.length, 32, 'the commit is a base64-encoded 32-byte sha256 digest');
 
-  // The value handed to onCommit is exactly the wire commit already broadcast
-  // in pair_commit — proving it is "sha256(pk_I)" as the initiator itself
-  // computes and sends it, not some other derivation.
-  const wireCommit = transport.sent.find((m) => m.event === 'pair_commit')?.payload?.commit;
-  assert.equal(commits[0], wireCommit);
-
-  A.cancelActiveHandshake();
+    // The value handed to onCommit is exactly the wire commit already broadcast
+    // in pair_commit — proving it is "sha256(pk_I)" as the initiator itself
+    // computes and sends it, not some other derivation.
+    const wireCommit = transport.sent.find((m) => m.event === 'pair_commit')?.payload?.commit;
+    assert.equal(commits[0], wireCommit);
+  } finally {
+    // Always tear the handshake down: an abandoned one keeps running and
+    // rejects with "Pairing timed out" AFTER the test ends, which the runner
+    // reports as stray async activity that buries the real failure.
+    A.cancelActiveHandshake();
+  }
   await assert.rejects(() => attempt, /Pairing cancelled/);
 });
 
@@ -212,7 +236,7 @@ test('QR path: wrong expectedCommit aborts at pair_commit, before pair_response 
     (err) => err.message === QR_COMMITMENT_MISMATCH_ERROR && err.code === 'QR_COMMITMENT_MISMATCH',
   );
 
-  await new Promise((r) => setTimeout(r, 20)); // let the joiner register its handlers
+  await joinerReady(transport);
 
   // A real (but different from expectedCommit) commit arrives on the wire —
   // as it would from a MITM standing between the joiner and whatever it
@@ -255,14 +279,17 @@ test('QR path: a genuinely different revealed key that does not hash to expected
     (err) => err.message === QR_COMMITMENT_MISMATCH_ERROR && err.code === 'QR_COMMITMENT_MISMATCH',
   );
 
-  await new Promise((r) => setTimeout(r, 20));
+  await joinerReady(transport);
 
   // Stage 1: the wire commit matches expectedCommit exactly (both are the
   // real, genuine commitment of `scanned`'s keypair) — passes the
   // pair_commit-stage gate, locks partnerCommit, and (in a real run) sends
   // pair_response.
   transport.emit('pair_commit', { userId: UUID_A, commit: scanned.commit });
-  await new Promise((r) => setTimeout(r, 20));
+  await waitFor(
+    () => transport.sent.some((m) => m.event === 'pair_response'),
+    'the joiner to answer the accepted commit',
+  );
 
   // Stage 2: reveal `substituted`'s REAL public key — a genuinely different,
   // validly-formed key that does not hash to `scanned.commit`. Models an
@@ -292,11 +319,13 @@ test('QR path: pair_reveal with no prior pair_commit is silently ignored — sta
 
   const expectedCommit = await random32Base64();
   const attempt = B.joinPairing('WOLF-QR09', UUID_B, () => {}, { expectedCommit });
-  await new Promise((r) => setTimeout(r, 20));
+  await joinerReady(transport);
 
   const substitutedKey = await random32Base64();
   transport.emit('pair_reveal', { userId: UUID_A, publicKey: substitutedKey });
-  await new Promise((r) => setTimeout(r, 20));
+  // Nothing to wait FOR here — the assertion is that nothing happens — so give
+  // the handler a real chance to run before concluding it stayed pending.
+  await new Promise((r) => setTimeout(r, 50));
 
   const PENDING = Symbol('pending');
   const outcome = await Promise.race([
