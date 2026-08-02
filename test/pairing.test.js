@@ -331,6 +331,25 @@ test('CONTESTED_ERROR / TAMPERED_ERROR are exported and reachable via the packag
   assert.equal(pairingNamespace.TAMPERED_CODE, TAMPERED_CODE);
 });
 
+test('CONTESTED_CODE / TAMPERED_CODE are the literal machine-readable code constants', () => {
+  // Pin the literal values (same style as
+  // pairing.qrCommitment.test.js:464's QR_COMMITMENT_MISMATCH_CODE pin) — a
+  // future accidental rename of the code string is exactly what callers
+  // branching on err.code would silently break on.
+  assert.equal(CONTESTED_CODE, 'CONTESTED');
+  assert.equal(TAMPERED_CODE, 'TAMPERED');
+});
+
+test('CONTESTED_ERROR / TAMPERED_ERROR message prose is unchanged (this PR does not reword them)', () => {
+  // This PR's central claim is that message text is untouched — only err.code
+  // is new — so existing prose-matching consumers keep working until they
+  // migrate. Pin the prose itself, not just its type, so a future edit that
+  // rewords either message trips this test rather than silently breaking a
+  // live consumer that still matches on message text.
+  assert.match(CONTESTED_ERROR, /^Pairing contested — more than one device answered this code\./);
+  assert.match(TAMPERED_ERROR, /^Pairing aborted — the key exchange failed verification\./);
+});
+
 test('contested: a second, different partner id rejects with err.code === CONTESTED_CODE', async () => {
   const transport = createRawTransport();
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
