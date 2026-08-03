@@ -1,4 +1,4 @@
-> **Verified against:** `b6bf6e0` · 2026-08-02 · by coder
+> **Verified against:** `79069b8` · 2026-08-03 · by fable
 
 # Pairing — the X25519 + SAS handshake
 
