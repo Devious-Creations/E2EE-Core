@@ -13,7 +13,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createPairing, buildRelayChannelName, PAIRING_WORDS } from '../src/pairing.js';
+import {
+  createPairing,
+  buildRelayChannelName,
+  PAIRING_WORDS,
+  CONTESTED_ERROR,
+  TAMPERED_ERROR,
+  CONTESTED_CODE,
+  TAMPERED_CODE,
+} from '../src/pairing.js';
+import { pairing as pairingNamespace } from '../src/index.js';
 import { createMemoryTransportPair } from '../adapters/memoryTransport.js';
 import { createMemoryKeyStore } from '../adapters/memoryKeyStore.js';
 import * as primitives from '../src/primitives.js';
@@ -302,6 +311,80 @@ test('contested: a duplicate response with a different public key rejects fatall
   assert.doesNotThrow(() => transport.emit('pair_confirm', { userId: UUID_B, mac: revivalMac }));
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(states.length, statesAtReject, 'no further onStateChange after the fatal abort');
+});
+
+// ── Error codes (board #288) ──────────────────────────────────────────────────
+// CONTESTED_ERROR and TAMPERED_ERROR are exported alongside a stable err.code
+// (following the QR_COMMITMENT_MISMATCH precedent from #8/#9), so callers can
+// branch on err.code instead of matching on message text. Message text itself
+// is unchanged — these are additive assertions on top of the same abort paths
+// the tripwire tests above already pin; they do not alter those tests.
+
+test('CONTESTED_ERROR / TAMPERED_ERROR are exported and reachable via the package index', () => {
+  assert.equal(typeof CONTESTED_ERROR, 'string');
+  assert.equal(typeof TAMPERED_ERROR, 'string');
+  assert.equal(typeof CONTESTED_CODE, 'string');
+  assert.equal(typeof TAMPERED_CODE, 'string');
+  assert.equal(pairingNamespace.CONTESTED_ERROR, CONTESTED_ERROR);
+  assert.equal(pairingNamespace.TAMPERED_ERROR, TAMPERED_ERROR);
+  assert.equal(pairingNamespace.CONTESTED_CODE, CONTESTED_CODE);
+  assert.equal(pairingNamespace.TAMPERED_CODE, TAMPERED_CODE);
+});
+
+test('CONTESTED_CODE / TAMPERED_CODE are the literal machine-readable code constants', () => {
+  // Pin the literal values (same style as
+  // pairing.qrCommitment.test.js:464's QR_COMMITMENT_MISMATCH_CODE pin) — a
+  // future accidental rename of the code string is exactly what callers
+  // branching on err.code would silently break on.
+  assert.equal(CONTESTED_CODE, 'CONTESTED');
+  assert.equal(TAMPERED_CODE, 'TAMPERED');
+});
+
+test('CONTESTED_ERROR / TAMPERED_ERROR message prose is unchanged (this PR does not reword them)', () => {
+  // This PR's central claim is that message text is untouched — only err.code
+  // is new — so existing prose-matching consumers keep working until they
+  // migrate. Pin the prose itself, not just its type, so a future edit that
+  // rewords either message trips this test rather than silently breaking a
+  // live consumer that still matches on message text.
+  assert.match(CONTESTED_ERROR, /^Pairing contested — more than one device answered this code\./);
+  assert.match(TAMPERED_ERROR, /^Pairing aborted — the key exchange failed verification\./);
+});
+
+test('contested: a second, different partner id rejects with err.code === CONTESTED_CODE', async () => {
+  const transport = createRawTransport();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  const attempt = A.initiatePairing('WOLF-9004', UUID_A, () => {});
+  const rejection = assert.rejects(
+    () => attempt,
+    (err) => err.message === CONTESTED_ERROR && err.code === CONTESTED_CODE,
+  );
+
+  await new Promise((r) => setTimeout(r, 20));
+  transport.emit('pair_response', { userId: UUID_B, publicKey: await random32Base64() });
+  await new Promise((r) => setTimeout(r, 20));
+  transport.emit('pair_response', { userId: UUID_C, publicKey: await random32Base64() });
+
+  await rejection;
+});
+
+test('tampered: a malformed commit rejects with err.code === TAMPERED_CODE', async () => {
+  const transport = createRawTransport();
+  const B = createPairing({ keyStore: createMemoryKeyStore(), transport });
+
+  const attempt = B.joinPairing('WOLF-9005', UUID_B, () => {});
+  const rejection = assert.rejects(
+    () => attempt,
+    (err) => err.message === TAMPERED_ERROR && err.code === TAMPERED_CODE,
+  );
+
+  await new Promise((r) => setTimeout(r, 20)); // let the joiner register its handlers
+
+  // A commit that cannot decode to a 32-byte digest — malformed, not merely
+  // contested.
+  transport.emit('pair_commit', { userId: UUID_A, commit: 'not-a-valid-commitment' });
+
+  await rejection;
 });
 
 test('transport.onError fails an in-flight handshake immediately', async () => {
