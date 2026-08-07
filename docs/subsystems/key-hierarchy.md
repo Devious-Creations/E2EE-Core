@@ -1,4 +1,4 @@
-> **Verified against:** `e2235f5` · 2026-07-30 · by coder (#142 backfill)
+> **Verified against:** `f8da815` · 2026-08-07 · by sonnet-main (PR #12 merge stamp)
 
 # Key hierarchy — the vault (DEK/KEK) and per-relationship provisioning
 
