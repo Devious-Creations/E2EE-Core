@@ -16,9 +16,22 @@
  *
  * @typedef {Object} KeyStore
  * @property {(key: string) => Promise<string|null>} getItem  Resolve to the stored
- *   value, or null if absent.
+ *   value, or `null` if the slot is genuinely absent. A `null` resolution is a
+ *   POSITIVE answer — "keystore reachable, slot absent" — never a stand-in for
+ *   a read failure. Any failure to determine the true state of the slot
+ *   (locked keystore, an invalidated hardware-backed key, a platform error)
+ *   MUST throw/reject instead of resolving `null`; callers rely on this to
+ *   distinguish "nothing stored" from "couldn't read" (see
+ *   `docs/subsystems/key-hierarchy.md`, the store-then-read-back invariant in
+ *   `dynamicKeys.js`).
  * @property {(key: string, value: string) => Promise<void>} setItem  Store/overwrite.
+ *   MUST throw/reject on write failure — a caller that awaits `setItem` and
+ *   sees it resolve is entitled to assume the write was accepted.
  * @property {(key: string) => Promise<void>} removeItem  Delete (no-op if absent).
+ *   MUST throw/reject on delete failure — the crypto-shred paths
+ *   (`cryptoShredDynamic`, `clearDEK`, `clearAllDynamicKeys`) report success
+ *   on the strength of a resolved `removeItem`; a silent failure there means
+ *   a shred that reports done while the key is still on the device.
  */
 
 /**

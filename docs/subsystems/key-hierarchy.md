@@ -1,4 +1,4 @@
-> **Verified against:** `f8da815` · 2026-08-07 · by sonnet-main (PR #12 merge stamp)
+> **Verified against:** branch `fix/450-keystore-read-guard` · 2026-08-07 · by coder-450
 
 # Key hierarchy — the vault (DEK/KEK) and per-relationship provisioning
 
@@ -97,8 +97,8 @@ master DEK, so a naive swap would otherwise unwrap cleanly and hand the wrong
 
 **Ordering: in both provisioning entry points, the DEK gate runs FIRST — no
 key material is loaded, generated, or unwrapped before it.** Both
-`provisionDynamic` (creator, `src/dynamicKeys.js:62-80`) and
-`acceptDynamicGrant` (accepter, `src/dynamicKeys.js:92-107`) call
+`provisionDynamic` (creator, `src/dynamicKeys.js:62-101`) and
+`acceptDynamicGrant` (accepter, `src/dynamicKeys.js:113-136`) call
 `keyVault.loadDEK()` and throw `'No master DEK loaded'` as the very first
 thing, before `loadDynamicSharedKey`, `generateSharedKey`, `unwrapSharedKey`,
 or `storeDynamicSharedKey` ever run. This was tightened in board #416: the
@@ -115,19 +115,72 @@ cache hit must succeed with no DEK loaded at all.)
 
 **Re-running provisioning reuses the existing local key.** `provisionDynamic`
 checks `keyVault.loadDynamicSharedKey(dynamicId)` (after the DEK gate) and
-only generates a fresh `K_shared` if none exists (`src/dynamicKeys.js:72-73`)
+only generates a fresh `K_shared` if none exists (`src/dynamicKeys.js:76-122`)
 — a re-pair or retry does not silently mint a second, divergent shared key
-for the same dynamic. **This guarantee rests on `loadDynamicSharedKey`
-reporting truthfully.** The DEK gate says nothing about that read: if the
-keystore returns a spurious `null` for a slot that actually still holds a
-key (while `loadDEK()` itself succeeds), `provisionDynamic` will generate and
-publish a **second, divergent** `K_shared` for the same dynamic — the gate
-added in board #416 only covers the DEK read, not this one.
+for the same dynamic.
+
+**Board #450 — the KeyStore contract now demands throw-on-failure, and the
+fresh-mint path proves retention before it wraps or delivers anything.**
+This guarantee used to rest entirely on `loadDynamicSharedKey` reporting a
+spurious `null` truthfully, with nothing enforcing that. Three changes
+narrow that gap — narrow, not close; see the residual below:
+
+- The `KeyStore` contract (`src/interfaces.js`) is now explicit: `getItem`
+  MUST throw/reject on any read failure (locked keystore, an invalidated
+  hardware-backed key, a platform error) — a `null` resolution is a
+  *positive* answer, "keystore reachable, slot absent," never a stand-in for
+  "couldn't tell." `setItem` MUST throw on write failure likewise. This is a
+  contract-only change; the reuse-check read in `provisionDynamic` already
+  propagated a rejection before minting anything, so a keystore that honours
+  the contract already aborted correctly — the tightened wording just makes
+  that reliance explicit and testable (`test/dynamicKeys.test.js`, "a
+  rejecting K_shared slot read aborts before anything is minted").
+- **Minting requires two pre-store reads that agree.** Before overwriting
+  the slot, the fresh-mint path re-reads it and requires the recheck to
+  return the same answer the reuse-check saw (`src/dynamicKeys.js:76-101`).
+  A *transient* spurious `null` — the exact board-#450 trigger — therefore
+  fails the second read and aborts with `'keystore gave inconsistent answers
+  for the K_shared slot'` **before** anything is written, which matters
+  because a store at that moment would overwrite the partner-shared key and
+  destroy the only evidence of the lie. This abort deliberately does NOT
+  shred: the differing answer may *be* the real key the first read lied
+  about.
+- The fresh-mint path in `provisionDynamic` (and the store site in
+  `acceptDynamicGrant`, `src/dynamicKeys.js:140-172`) then follows
+  **store-then-read-back**: mint (or unwrap) the key, `storeDynamicSharedKey`
+  it, then `loadDynamicSharedKey` it back and require the read-back to equal
+  exactly what was just stored, *before* wrapping the own grant or the
+  delivery. A `null` read-back (write silently lost) or a differing value
+  (corrupted write) shreds the unverified slot (so a retry re-mints instead
+  of reusing a corrupt value through the no-read-back reuse branch) and
+  throws `'keystore failed to retain K_shared — provisioning aborted'` — a
+  key the device cannot prove it retains is never wrapped for the partner.
+  The existing-key reuse path is unchanged (no write, no read-back, since
+  nothing new was minted).
+
+**Residual, honestly — two distinct holes remain, one per layer:**
+
+1. **A keystore that violates the contract *persistently*** — resolving
+   `null` for a slot it actually holds, on every read, without erroring —
+   still produces the full board-#450 outcome: both pre-store reads agree on
+   the lie, the mint proceeds, the store overwrites the real key, and the
+   read-back verifies the wrong one. Store-then-read-back structurally
+   cannot detect this (the write destroys the evidence), and this library
+   cannot enforce honesty on an injected adapter — the two-reads guard
+   converts the *transient* lie into an abort, nothing here can convert the
+   persistent one. The enforcing change is the adapter's (`expo-secure-store`
+   wrapper in `Smaddle-App`): failures must throw, never resolve `null`.
+2. **A keystore that truthfully answers "absent"** for a dynamic the server
+   has already recorded a grant for (wiped keystore, restored device) is not
+   a keystore-honesty problem at all — no read guard on this side can catch
+   it. That's the application-level check against the server-recorded grant.
+
+Both are the `Smaddle-App` half of board #450 (layer 2), not this repo's.
 
 **`loadDynamicKeys` rehydrates from the own grant, and never re-persists on
 failure.** If the local slot is empty, it falls back to unwrapping the
 supplied `ownGrant` under the DEK (the "recovery on a fresh device" case,
-`src/dynamicKeys.js:117-143`). An unwrap failure (wrong key, tampered, or
+`src/dynamicKeys.js:183-209`). An unwrap failure (wrong key, tampered, or
 bound to a different dynamic) is reported through the optional
 `onUnwrapFault` callback and the function returns `null` — it does **not**
 throw, and it does **not** cache anything on failure. Telemetry for that
