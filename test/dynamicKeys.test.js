@@ -106,3 +106,47 @@ test('onUnwrapFault observes a failed own-grant unwrap (and null is still return
   });
   assert.equal(await explosive.loadDynamicKeys(DYN, ownGrant), null);
 });
+
+// board #416 — the DEK gate must run BEFORE any other key-material read/
+// write, so a spurious SecureStore null (locked device, Android Keystore
+// invalidation) can never leave a stray local slot, or unwrap/publish key
+// material, ahead of the throw. NOTE: the old order already threw before
+// storeDynamicSharedKey and before the return, so this is hardening (no
+// key material produced when the DEK is absent), not a fix for a leak —
+// see docs/subsystems/key-hierarchy.md.
+
+test('provisionDynamic reads the DEK first and nothing else before throwing', async (t) => {
+  const store = createMemoryKeyStore(); // no DEK stored -> keystore getItem resolves null
+  const getSpy = t.mock.method(store, 'getItem');
+  const vault = V.createKeyVault(store);
+  const storeSharedSpy = t.mock.method(vault, 'storeDynamicSharedKey');
+  const dyn = createDynamicKeys(vault);
+  const kPair = await P.encodeBase64(await P.randomBytes(32));
+
+  await assert.rejects(() => dyn.provisionDynamic('dyn-gate', kPair), /No master DEK loaded/);
+  // The DEK read is the ONLY keystore read that happened, and it came first —
+  // this proves the existing-key lookup (and, transitively, generation on a
+  // miss) never ran. generateSharedKey itself is not observable through this
+  // seam, so this is what the test can actually prove.
+  assert.equal(getSpy.mock.callCount(), 1);
+  assert.deepEqual(getSpy.mock.calls[0].arguments, ['cloud_dek']);
+  assert.equal(storeSharedSpy.mock.callCount(), 0);
+});
+
+test('acceptDynamicGrant reads the DEK first and never unwraps or persists before throwing', async (t) => {
+  const store = createMemoryKeyStore(); // no DEK stored -> keystore getItem resolves null
+  const getSpy = t.mock.method(store, 'getItem');
+  const vault = V.createKeyVault(store);
+  const storeSharedSpy = t.mock.method(vault, 'storeDynamicSharedKey');
+  const dyn = createDynamicKeys(vault);
+  const kPair = await P.encodeBase64(await P.randomBytes(32));
+  // If the delivery were unwrapped before the gate, this malformed blob would
+  // surface a decrypt/base64 error instead of the DEK-gate error.
+  const bogusDelivery = { wrapped: 'not-valid-base64!!', nonce: 'also-not-valid!!' };
+
+  await assert.rejects(() => dyn.acceptDynamicGrant('dyn-gate', bogusDelivery, kPair), /No master DEK loaded/);
+  // The DEK read is the ONLY keystore read that happened, and it came first.
+  assert.equal(getSpy.mock.callCount(), 1);
+  assert.deepEqual(getSpy.mock.calls[0].arguments, ['cloud_dek']);
+  assert.equal(storeSharedSpy.mock.callCount(), 0);
+});

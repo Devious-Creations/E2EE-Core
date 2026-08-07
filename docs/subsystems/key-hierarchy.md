@@ -95,23 +95,39 @@ master DEK, so a naive swap would otherwise unwrap cleanly and hand the wrong
 
 ## Invariants
 
-**Ordering: wrap/unwrap the local secret before persisting any local
-slot.** Both `provisionDynamic` (creator) and `acceptDynamicGrant` (accepter)
-load the DEK and produce the wrapped own-grant *before* calling
-`storeDynamicSharedKey` (`src/dynamicKeys.js:66-73, 91-97`). A missing DEK
-throws before any local key is persisted, so a member never ends up holding
-a local `K_shared` slot with no recoverable cloud grant behind it.
+**Ordering: in both provisioning entry points, the DEK gate runs FIRST — no
+key material is loaded, generated, or unwrapped before it.** Both
+`provisionDynamic` (creator, `src/dynamicKeys.js:62-80`) and
+`acceptDynamicGrant` (accepter, `src/dynamicKeys.js:92-107`) call
+`keyVault.loadDEK()` and throw `'No master DEK loaded'` as the very first
+thing, before `loadDynamicSharedKey`, `generateSharedKey`, `unwrapSharedKey`,
+or `storeDynamicSharedKey` ever run. This was tightened in board #416: the
+gate used to sit *after* the reuse-vs-generate decision (`provisionDynamic`)
+or after the delivery unwrap (`acceptDynamicGrant`). That older order was
+never a correctness bug — the throw already preceded `storeDynamicSharedKey`
+and the `return`, so a doomed call never persisted, returned, or delivered
+anything. It was hardening: a doomed call would still read the local slot
+and generate (or unwrap) 32 bytes of key material that could never be used.
+The gate now guarantees no key material is produced at all when the DEK is
+absent. (`loadDynamicKeys`, covered below, is a deliberate exception: it
+reads the cached local `K_shared` slot *before* any DEK check, because a
+cache hit must succeed with no DEK loaded at all.)
 
 **Re-running provisioning reuses the existing local key.** `provisionDynamic`
-checks `keyVault.loadDynamicSharedKey(dynamicId)` first and only generates a
-fresh `K_shared` if none exists (`src/dynamicKeys.js:63-64`) — a re-pair or
-retry does not silently mint a second, divergent shared key for the same
-dynamic.
+checks `keyVault.loadDynamicSharedKey(dynamicId)` (after the DEK gate) and
+only generates a fresh `K_shared` if none exists (`src/dynamicKeys.js:72-73`)
+— a re-pair or retry does not silently mint a second, divergent shared key
+for the same dynamic. **This guarantee rests on `loadDynamicSharedKey`
+reporting truthfully.** The DEK gate says nothing about that read: if the
+keystore returns a spurious `null` for a slot that actually still holds a
+key (while `loadDEK()` itself succeeds), `provisionDynamic` will generate and
+publish a **second, divergent** `K_shared` for the same dynamic — the gate
+added in board #416 only covers the DEK read, not this one.
 
 **`loadDynamicKeys` rehydrates from the own grant, and never re-persists on
 failure.** If the local slot is empty, it falls back to unwrapping the
 supplied `ownGrant` under the DEK (the "recovery on a fresh device" case,
-`src/dynamicKeys.js:109-135`). An unwrap failure (wrong key, tampered, or
+`src/dynamicKeys.js:117-143`). An unwrap failure (wrong key, tampered, or
 bound to a different dynamic) is reported through the optional
 `onUnwrapFault` callback and the function returns `null` — it does **not**
 throw, and it does **not** cache anything on failure. Telemetry for that
