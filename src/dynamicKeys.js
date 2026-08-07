@@ -60,13 +60,17 @@ export function createDynamicKeys(keyVault, { onUnwrapFault } = {}) {
    * @returns {Promise<{ ownGrant: {wrapped:string,nonce:string}, delivery: {wrapped:string,nonce:string} }>}
    */
   async function provisionDynamic(dynamicId, pairKeyB64) {
-    const existingB64 = await keyVault.loadDynamicSharedKey(dynamicId);
-    const kSharedB64 = existingB64 ?? (await primitives.encodeBase64(await generateSharedKey()));
-
-    // Wrap BEFORE persisting the slot: a missing DEK must throw without leaving a
-    // local key that has no recoverable cloud grant.
+    // Gate on the master DEK FIRST, before any key is loaded, generated, or
+    // wrapped. The old order still threw before storeDynamicSharedKey/return,
+    // so a doomed call never persisted, returned, or delivered anything — but
+    // it would still read the local slot and (on a miss) generate 32 bytes of
+    // key material that could never be used. Gating first means no key
+    // material is produced at all when the DEK is absent (board #416).
     const dekB64 = await keyVault.loadDEK();
     if (!dekB64) throw new Error('No master DEK loaded');
+
+    const existingB64 = await keyVault.loadDynamicSharedKey(dynamicId);
+    const kSharedB64 = existingB64 ?? (await primitives.encodeBase64(await generateSharedKey()));
 
     const ownGrant = await wrapSharedKey(dynamicId, kSharedB64, dekB64);
     const delivery = await wrapSharedKey(dynamicId, kSharedB64, pairKeyB64);
@@ -86,12 +90,16 @@ export function createDynamicKeys(keyVault, { onUnwrapFault } = {}) {
    * @throws if K_pair is wrong or the delivery is bound to a different dynamic
    */
   async function acceptDynamicGrant(dynamicId, delivery, pairKeyB64) {
-    const kSharedB64 = await unwrapSharedKey(dynamicId, delivery.wrapped, delivery.nonce, pairKeyB64);
-
-    // Wrap to the master DEK FIRST: a missing DEK must throw before we persist the
-    // local slot, so the accepter never holds a local key with no cloud grant.
+    // Gate on the master DEK FIRST, before the delivery is even unwrapped.
+    // The old order still threw before storeDynamicSharedKey/return, so a
+    // doomed call never persisted or returned anything — but it would still
+    // unwrap the delivered key material for no reason. Gating first means no
+    // key material is unwrapped at all when the DEK is absent (board #416 —
+    // see the matching gate in provisionDynamic).
     const dekB64 = await keyVault.loadDEK();
     if (!dekB64) throw new Error('No master DEK loaded');
+
+    const kSharedB64 = await unwrapSharedKey(dynamicId, delivery.wrapped, delivery.nonce, pairKeyB64);
     const ownGrant = await wrapSharedKey(dynamicId, kSharedB64, dekB64);
 
     await keyVault.storeDynamicSharedKey(dynamicId, kSharedB64);
