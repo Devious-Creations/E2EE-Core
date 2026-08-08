@@ -69,12 +69,60 @@ export function createDynamicKeys(keyVault, { onUnwrapFault } = {}) {
     const dekB64 = await keyVault.loadDEK();
     if (!dekB64) throw new Error('No master DEK loaded');
 
+    // A rejection here (locked keystore, invalidated key, platform error —
+    // see the KeyStore contract in interfaces.js) propagates and aborts
+    // BEFORE anything is minted. A `null` resolution, by contrast, is the
+    // slot's truthful "nothing stored yet" answer.
     const existingB64 = await keyVault.loadDynamicSharedKey(dynamicId);
-    const kSharedB64 = existingB64 ?? (await primitives.encodeBase64(await generateSharedKey()));
+
+    let kSharedB64;
+    if (existingB64) {
+      kSharedB64 = existingB64;
+    } else {
+      // Fresh mint: store first, then read the slot back and require it
+      // returns exactly what was just stored. A key the device cannot prove
+      // it retains must never be wrapped for the partner (board #450) — a
+      // spurious null (or a stale different value) on this read used to be
+      // indistinguishable from "no key exists yet" and would mint a second,
+      // divergent K_shared for the same dynamic.
+      const minted = await primitives.encodeBase64(await generateSharedKey());
+      // Re-read the slot before overwriting it (board #450, review finding 1):
+      // the reuse-check read above may have answered a spurious null from a
+      // contract-violating adapter, and store-then-read-back cannot catch that
+      // case — the store would overwrite the partner-shared key and destroy
+      // the only evidence of the lie. Minting therefore requires TWO reads
+      // that agree the slot is empty; a transient lie fails the second read.
+      // Deliberately NO shred on this abort: a differing answer here may BE
+      // the real key the first read lied about.
+      const recheck = await keyVault.loadDynamicSharedKey(dynamicId);
+      if (recheck !== existingB64) {
+        throw new Error(
+          'keystore gave inconsistent answers for the K_shared slot — provisioning aborted',
+        );
+      }
+      await keyVault.storeDynamicSharedKey(dynamicId, minted);
+      const readBack = await keyVault.loadDynamicSharedKey(dynamicId);
+      if (readBack !== minted) {
+        // The slot now holds our own failed/corrupt write; clear it so a
+        // retry re-mints instead of REUSING the corrupt value through the
+        // no-read-back reuse branch above. Best-effort: the shred rides the
+        // same unreliable adapter that just failed. (Reaching here with the
+        // slot holding a REAL key would need the adapter to lie twice and
+        // then fail the store — at that point nothing it answers is
+        // trustworthy anyway; the recheck above is the guard for the
+        // one-transient-lie case.)
+        try {
+          await keyVault.cryptoShredDynamic(dynamicId);
+        } catch {
+          /* the throw below already reports the failure */
+        }
+        throw new Error('keystore failed to retain K_shared — provisioning aborted');
+      }
+      kSharedB64 = readBack;
+    }
 
     const ownGrant = await wrapSharedKey(dynamicId, kSharedB64, dekB64);
     const delivery = await wrapSharedKey(dynamicId, kSharedB64, pairKeyB64);
-    if (!existingB64) await keyVault.storeDynamicSharedKey(dynamicId, kSharedB64);
 
     return { ownGrant, delivery };
   }
@@ -99,10 +147,28 @@ export function createDynamicKeys(keyVault, { onUnwrapFault } = {}) {
     const dekB64 = await keyVault.loadDEK();
     if (!dekB64) throw new Error('No master DEK loaded');
 
-    const kSharedB64 = await unwrapSharedKey(dynamicId, delivery.wrapped, delivery.nonce, pairKeyB64);
-    const ownGrant = await wrapSharedKey(dynamicId, kSharedB64, dekB64);
+    let kSharedB64 = await unwrapSharedKey(dynamicId, delivery.wrapped, delivery.nonce, pairKeyB64);
 
+    // Same store-then-read-back invariant as the fresh-mint path in
+    // provisionDynamic: never report acceptance success for a key the
+    // keystore can't prove it retained.
     await keyVault.storeDynamicSharedKey(dynamicId, kSharedB64);
+    const readBack = await keyVault.loadDynamicSharedKey(dynamicId);
+    if (readBack !== kSharedB64) {
+      // Clear our own failed write so a retry (same delivery) re-stores
+      // rather than reusing a corrupt slot — mirrors provisionDynamic.
+      try {
+        await keyVault.cryptoShredDynamic(dynamicId);
+      } catch {
+        /* the throw below already reports the failure */
+      }
+      throw new Error('keystore failed to retain K_shared — provisioning aborted');
+    }
+    // Wrap the VERIFIED value, mirroring provisionDynamic — keeps the guard
+    // and the wrap coupled to the same variable in both sites.
+    kSharedB64 = readBack;
+
+    const ownGrant = await wrapSharedKey(dynamicId, kSharedB64, dekB64);
     return { ownGrant };
   }
 
