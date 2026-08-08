@@ -1,4 +1,4 @@
-> **Verified against:** branch `fix/450-keystore-read-guard` · 2026-08-07 · by coder-450
+> **Verified against:** `cdf75b4` · 2026-08-08 · by coder (fable-morning wave)
 
 # Key hierarchy — the vault (DEK/KEK) and per-relationship provisioning
 
