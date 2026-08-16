@@ -1,4 +1,4 @@
-> **Verified against:** branch `fix/450-keystore-read-guard` · 2026-08-07 · by coder-450
+> **Verified against:** branch `fix/unwrap-fault-dynamic-id` · 2026-08-16 · by coder
 
 # Key hierarchy — the vault (DEK/KEK) and per-relationship provisioning
 
@@ -182,10 +182,13 @@ failure.** If the local slot is empty, it falls back to unwrapping the
 supplied `ownGrant` under the DEK (the "recovery on a fresh device" case,
 `src/dynamicKeys.js:183-209`). An unwrap failure (wrong key, tampered, or
 bound to a different dynamic) is reported through the optional
-`onUnwrapFault` callback and the function returns `null` — it does **not**
-throw, and it does **not** cache anything on failure. Telemetry for that
-failure is deliberately left to the consumer
-(`src/dynamicKeys.js:46-50`) — this module never phones out on its own.
+`onUnwrapFault(err, dynamicId)` callback and the function returns `null` —
+it does **not** throw, and it does **not** cache anything on failure. The
+`dynamicId` argument is the id `loadDynamicKeys` was called with, so a
+consumer can dedupe/key telemetry per-dynamic without this module owning any
+dedupe policy itself; `loadDynamicKeys` is currently the only call site.
+Telemetry for that failure is deliberately left to the consumer
+(`src/dynamicKeys.js:46-53`) — this module never phones out on its own.
 
 ## Traps
 
