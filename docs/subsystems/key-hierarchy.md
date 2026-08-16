@@ -1,4 +1,7 @@
 > **Verified against:** branch `fix/unwrap-fault-dynamic-id` · 2026-08-16 · by coder
+> (every `src/dynamicKeys.js` line anchor in this doc was re-verified against
+> the file at that commit, after the `onUnwrapFault` JSDoc's +5 lines shifted
+> them)
 
 # Key hierarchy — the vault (DEK/KEK) and per-relationship provisioning
 
@@ -97,8 +100,8 @@ master DEK, so a naive swap would otherwise unwrap cleanly and hand the wrong
 
 **Ordering: in both provisioning entry points, the DEK gate runs FIRST — no
 key material is loaded, generated, or unwrapped before it.** Both
-`provisionDynamic` (creator, `src/dynamicKeys.js:62-101`) and
-`acceptDynamicGrant` (accepter, `src/dynamicKeys.js:113-136`) call
+`provisionDynamic` (creator, `src/dynamicKeys.js:67-133`) and
+`acceptDynamicGrant` (accepter, `src/dynamicKeys.js:145-178`) call
 `keyVault.loadDEK()` and throw `'No master DEK loaded'` as the very first
 thing, before `loadDynamicSharedKey`, `generateSharedKey`, `unwrapSharedKey`,
 or `storeDynamicSharedKey` ever run. This was tightened in board #416: the
@@ -115,7 +118,7 @@ cache hit must succeed with no DEK loaded at all.)
 
 **Re-running provisioning reuses the existing local key.** `provisionDynamic`
 checks `keyVault.loadDynamicSharedKey(dynamicId)` (after the DEK gate) and
-only generates a fresh `K_shared` if none exists (`src/dynamicKeys.js:76-122`)
+only generates a fresh `K_shared` if none exists (`src/dynamicKeys.js:81-127`)
 — a re-pair or retry does not silently mint a second, divergent shared key
 for the same dynamic.
 
@@ -137,7 +140,7 @@ narrow that gap — narrow, not close; see the residual below:
   rejecting K_shared slot read aborts before anything is minted").
 - **Minting requires two pre-store reads that agree.** Before overwriting
   the slot, the fresh-mint path re-reads it and requires the recheck to
-  return the same answer the reuse-check saw (`src/dynamicKeys.js:76-101`).
+  return the same answer the reuse-check saw (`src/dynamicKeys.js:81-106`).
   A *transient* spurious `null` — the exact board-#450 trigger — therefore
   fails the second read and aborts with `'keystore gave inconsistent answers
   for the K_shared slot'` **before** anything is written, which matters
@@ -146,7 +149,7 @@ narrow that gap — narrow, not close; see the residual below:
   shred: the differing answer may *be* the real key the first read lied
   about.
 - The fresh-mint path in `provisionDynamic` (and the store site in
-  `acceptDynamicGrant`, `src/dynamicKeys.js:140-172`) then follows
+  `acceptDynamicGrant`, `src/dynamicKeys.js:145-177`) then follows
   **store-then-read-back**: mint (or unwrap) the key, `storeDynamicSharedKey`
   it, then `loadDynamicSharedKey` it back and require the read-back to equal
   exactly what was just stored, *before* wrapping the own grant or the
@@ -180,15 +183,18 @@ Both are the `Smaddle-App` half of board #450 (layer 2), not this repo's.
 **`loadDynamicKeys` rehydrates from the own grant, and never re-persists on
 failure.** If the local slot is empty, it falls back to unwrapping the
 supplied `ownGrant` under the DEK (the "recovery on a fresh device" case,
-`src/dynamicKeys.js:183-209`). An unwrap failure (wrong key, tampered, or
+`src/dynamicKeys.js:188-214`). An unwrap failure (wrong key, tampered, or
 bound to a different dynamic) is reported through the optional
 `onUnwrapFault(err, dynamicId)` callback and the function returns `null` —
 it does **not** throw, and it does **not** cache anything on failure. The
 `dynamicId` argument is the id `loadDynamicKeys` was called with, so a
 consumer can dedupe/key telemetry per-dynamic without this module owning any
-dedupe policy itself; `loadDynamicKeys` is currently the only call site.
-Telemetry for that failure is deliberately left to the consumer
-(`src/dynamicKeys.js:46-53`) — this module never phones out on its own.
+dedupe policy itself; `loadDynamicKeys` is currently the only call site. The
+library takes no position on where that telemetry goes, but `dynamicId` is a
+relationship identifier — a consumer exporting it to a third-party sink
+should hash/scrub it first. Telemetry for that failure is deliberately left
+to the consumer (`src/dynamicKeys.js:46-55`) — this module never phones out
+on its own.
 
 ## Traps
 
@@ -217,3 +223,10 @@ passwords. Do not "fix" this by moving recovery codes onto scrypt.
   password-derived.
 - No collision detection for `sanitizeStoreKey` at the storage layer — the
   AAD check is what catches it, and only for dynamic-id mismatches.
+- `loadDynamicKeys`'s `onUnwrapFault` does not fire for a structurally
+  malformed own grant (missing `wrapped`/`nonce`, `src/dynamicKeys.js:195`) —
+  that early return is silent, not observed. The observer covers
+  cryptographic unwrap failure only; widening it to structural malformation
+  would be a semantic change for any consumer already keying telemetry on
+  it, so a corrupt-grant census built purely on `onUnwrapFault` currently
+  undercounts that class.
