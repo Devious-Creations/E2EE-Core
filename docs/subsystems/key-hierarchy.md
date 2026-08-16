@@ -1,7 +1,8 @@
 > **Verified against:** branch `fix/unwrap-fault-dynamic-id` · 2026-08-16 · by coder
 > (every `src/dynamicKeys.js` line anchor in this doc was re-verified against
 > the file at that commit, after the `onUnwrapFault` JSDoc's +5 lines shifted
-> them)
+> them; supersedes the `cdf75b4` · 2026-08-08 stamp — `main` gained no code
+> change in between, PR #15 was stamp-only)
 
 # Key hierarchy — the vault (DEK/KEK) and per-relationship provisioning
 
