@@ -43,11 +43,16 @@ async function unwrapSharedKey(dynamicId, wrappedB64, nonceB64, wrapKeyB64) {
 /**
  * Bind the provisioning flow to a keyVault (which owns the injected KeyStore).
  * @param {ReturnType<import('./keyVault.js').createKeyVault>} keyVault
- * @param {{ onUnwrapFault?: (err: Error) => void }} [opts] - onUnwrapFault is
- *   called when an own-grant unwrap fails during loadDynamicKeys (wrong key,
- *   tampered, or bound to a different dynamic). That failure silently makes the
- *   whole shared plane un-decryptable, so a consumer will usually want to
- *   surface it (telemetry lives in the consumer, never here).
+ * @param {{ onUnwrapFault?: (err: Error, dynamicId: string) => void }} [opts] -
+ *   onUnwrapFault is called when an own-grant unwrap fails during
+ *   loadDynamicKeys (wrong key, tampered, or bound to a different dynamic).
+ *   The second argument is the `dynamicId` that was passed to
+ *   `loadDynamicKeys` for that call — the caller's own identifier, always
+ *   the requested id even when the unwrap error is a mismatched-binding one
+ *   (i.e. it is NOT necessarily the id the failed blob was actually bound
+ *   to). That failure silently makes the whole shared plane un-decryptable,
+ *   so a consumer will usually want to surface it, keyed by dynamicId
+ *   (telemetry/dedupe policy lives in the consumer, never here).
  */
 export function createDynamicKeys(keyVault, { onUnwrapFault } = {}) {
   /**
@@ -198,7 +203,7 @@ export function createDynamicKeys(keyVault, { onUnwrapFault } = {}) {
     } catch (err) {
       // wrong key, tampered, or bound to a different dynamic
       try {
-        onUnwrapFault?.(err);
+        onUnwrapFault?.(err, dynamicId);
       } catch {
         /* the observer must never break the load path */
       }

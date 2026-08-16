@@ -81,7 +81,7 @@ test('loadDynamicKeys rehydrates K_shared from the own grant after a local shred
 test('onUnwrapFault observes a failed own-grant unwrap (and null is still returned)', async () => {
   const vault = await memberWithDEK();
   const faults = [];
-  const dyn = createDynamicKeys(vault, { onUnwrapFault: (err) => faults.push(err) });
+  const dyn = createDynamicKeys(vault, { onUnwrapFault: (err, dynamicId) => faults.push({ err, dynamicId }) });
 
   const kPair = await P.encodeBase64(await P.randomBytes(32));
   const DYN = 'dyn-fault';
@@ -93,19 +93,54 @@ test('onUnwrapFault observes a failed own-grant unwrap (and null is still return
 
   assert.equal(await dyn.loadDynamicKeys(DYN, ownGrant), null);
   assert.equal(faults.length, 1);
-  assert.ok(faults[0] instanceof Error);
+  assert.ok(faults[0].err instanceof Error);
+  // The second argument is the id loadDynamicKeys was CALLED with — this is
+  // what lets a consumer dedupe/key telemetry per-dynamic (board #549).
+  assert.equal(faults[0].dynamicId, DYN);
 
   // A missing grant is NOT a fault — nothing to unwrap, nothing to observe.
   assert.equal(await dyn.loadDynamicKeys('dyn-absent'), null);
   assert.equal(faults.length, 1);
+});
 
-  // A throwing observer must never break the load path.
+test('a throwing onUnwrapFault never breaks the load path', async () => {
+  // Kept as its own test (separate from the dynamicId-plumbing assertions
+  // above) so a regression in one guarantee can't take the other's coverage
+  // offline with it.
+  const vault = await memberWithDEK();
+  const kPair = await P.encodeBase64(await P.randomBytes(32));
+  const DYN = 'dyn-fault-throwing-observer';
   const explosive = createDynamicKeys(vault, {
     onUnwrapFault: () => {
       throw new Error('observer bug');
     },
   });
+  const { ownGrant } = await explosive.provisionDynamic(DYN, kPair);
+
+  // Fresh slot + a DIFFERENT master DEK → the own grant no longer unwraps.
+  await vault.cryptoShredDynamic(DYN);
+  await vault.storeDEK(await P.encodeBase64(await V.generateDEK()));
+
   assert.equal(await explosive.loadDynamicKeys(DYN, ownGrant), null);
+});
+
+test('onUnwrapFault carries the CALLER-supplied dynamicId even for a mismatched-binding failure', async () => {
+  // The grant is validly wrapped and bound to dyn-real (via unwrapSharedKey's
+  // AAD check), but loadDynamicKeys is called with a DIFFERENT dynamicId —
+  // the fault must report the id the caller asked for, not the id embedded
+  // in the blob. No prior shred needed: 'dyn-mismatch' has no local slot to
+  // begin with, so loadDynamicKeys falls straight through to the ownGrant
+  // unwrap, which is where the AAD binding check rejects it.
+  const vault = await memberWithDEK();
+  const faults = [];
+  const dyn = createDynamicKeys(vault, { onUnwrapFault: (err, dynamicId) => faults.push({ err, dynamicId }) });
+
+  const kPair = await P.encodeBase64(await P.randomBytes(32));
+  const { ownGrant } = await dyn.provisionDynamic('dyn-real', kPair);
+
+  assert.equal(await dyn.loadDynamicKeys('dyn-mismatch', ownGrant), null);
+  assert.equal(faults.length, 1);
+  assert.equal(faults[0].dynamicId, 'dyn-mismatch');
 });
 
 // board #416 — the DEK gate must run BEFORE any other key-material read/
