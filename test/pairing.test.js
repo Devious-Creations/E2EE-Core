@@ -166,8 +166,7 @@ test('clearPairing + removePairing wipe the stored root key', async () => {
 // macrotask yield on every KeyStore op so two concurrent calls are forced to
 // interleave their read/write steps instead of happening to run atomically
 // back-to-back — without it, this race would only fail intermittently.
-function createDelayedKeyStore() {
-  const base = createMemoryKeyStore();
+function createDelayedKeyStore(base = createMemoryKeyStore()) {
   const yieldTick = () => new Promise((resolve) => setImmediate(resolve));
   return {
     async getItem(key) {
@@ -202,6 +201,94 @@ test('relay_pairings race: concurrent dynamicId + nickname writes both survive',
   assert.equal(rec.nickname, 'Partner Nickname', 'the nickname write must not be lost to the interleave');
 });
 
+// The app builds a fresh controller per call over ONE shared, long-lived
+// KeyStore (`createPairing({ keyStore: sharedStore })` on every wrapper
+// call) — a lock created inside `createPairing` would give each controller
+// its own independent lock over the SAME store, serializing nothing. This
+// pins the lock to the store object itself: two controllers built over one
+// store must still queue behind each other.
+test('relay_pairings lock: two controllers over the SAME KeyStore still serialize', async () => {
+  const keyStore = createDelayedKeyStore();
+  const mk = () => createPairing({ keyStore, transport: createMemoryTransportPair()[0] });
+  const owner = mk();
+  const id = await owner.storePairing('partner-1', 'root-key', 'relay:a:b');
+
+  const controllerA = mk();
+  const controllerB = mk();
+
+  await Promise.all([
+    controllerA.setPairingDynamicId(id, 'dynamic-123'),
+    controllerB.updatePairingNickname(id, 'Partner Nickname'),
+  ]);
+
+  const [rec] = await owner.getStoredPairings();
+  assert.equal(
+    rec.dynamicId,
+    'dynamic-123',
+    'the dynamicId write must not be lost when a second controller shares the store',
+  );
+  assert.equal(
+    rec.nickname,
+    'Partner Nickname',
+    'the nickname write must not be lost when a second controller shares the store',
+  );
+});
+
+// The legacy migration (`migrateLegacyPairing`, run from the unlocked read
+// path) writes `relay_pairings` outside the lock — a concurrent locked
+// mutator can read before the migration's write lands and then overwrite it,
+// or vice versa. Both the migrated legacy pairing and the concurrently
+// stored new one must survive.
+test('relay_pairings lock: legacy migration does not lose a concurrent locked storePairing', async () => {
+  const base = createMemoryKeyStore();
+  await base.setItem('relay_partner_id', 'legacy-partner');
+  await base.setItem('relay_shared_key', 'legacy-key');
+  await base.setItem('relay_channel_name', 'relay:legacy:chan');
+
+  // Gate the FIRST write of `relay_pairings` — the unlocked migration's own
+  // write, started by the plain `getStoredPairings()` call below before the
+  // locked `storePairing()` call even begins. Holding it open until after
+  // `storePairing()` has fully landed its own write reproduces the exact
+  // loss: the migration's stale snapshot (just the legacy entry) arrives
+  // LAST and clobbers the newly stored pairing.
+  let releaseMigrationWrite;
+  const migrationWriteGate = new Promise((resolve) => {
+    releaseMigrationWrite = resolve;
+  });
+  let pairingsWriteCount = 0;
+  const keyStore = {
+    getItem: (key) => base.getItem(key),
+    removeItem: (key) => base.removeItem(key),
+    async setItem(key, value) {
+      if (key === 'relay_pairings') {
+        pairingsWriteCount += 1;
+        if (pairingsWriteCount === 1) await migrationWriteGate;
+      }
+      return base.setItem(key, value);
+    },
+  };
+
+  const controller = createPairing({ keyStore, transport: createMemoryTransportPair()[0] });
+
+  const migrateRead = controller.getStoredPairings(); // starts migrating, blocks on its own write
+  const storeNew = controller.storePairing('partner-2', 'root-key-2', 'relay:a:b');
+  // Give storePairing room to fully land its own write before releasing the
+  // stale migration write (on the locked/fixed code storePairing can't even
+  // start until the migration's lock section settles, so this wait is a
+  // no-op there and only matters for the unlocked/base behaviour).
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseMigrationWrite();
+  await Promise.all([migrateRead, storeNew]);
+
+  const pairings = await controller.getStoredPairings();
+  const partnerIds = pairings.map((p) => p.partnerId).sort();
+  assert.deepEqual(
+    partnerIds,
+    ['legacy-partner', 'partner-2'],
+    'the migrated legacy pairing and the concurrently stored new pairing must both survive',
+  );
+});
+
 test('relay_pairings lock: a mutator that throws does not wedge the next one', async () => {
   const base = createMemoryKeyStore();
   let failNextPairingsWrite = false;
@@ -220,16 +307,46 @@ test('relay_pairings lock: a mutator that throws does not wedge the next one', a
   const id = await controller.storePairing('partner-1', 'root-key', 'relay:a:b');
 
   failNextPairingsWrite = true;
-  await assert.rejects(
-    () => controller.updatePairingNickname(id, 'boom'),
-    /simulated store failure/,
-    'the failing mutator itself must still reject',
-  );
+  // Start both before awaiting either: p1 must reject with the simulated
+  // failure and p2 must still land — a sequential await between the two
+  // calls would pass even with no lock recovery at all, since the second
+  // call would simply start fresh after the first settles.
+  const p1 = controller.updatePairingNickname(id, 'boom');
+  const p2 = controller.updatePairingNickname(id, 'ok');
+  await assert.rejects(() => p1, /simulated store failure/, 'the failing mutator itself must still reject');
+  await p2;
 
-  // The lock must not be left held by the failed critical section — a later
-  // mutator has to complete normally, not hang or inherit the rejection.
-  await controller.updatePairingNickname(id, 'ok');
   const [rec] = await controller.getStoredPairings();
+  assert.equal(rec.nickname, 'ok', "p2's write must be the one that survives");
+});
+
+test('relay_pairings lock: a throwing mutator does not wedge a second controller over the same store', async () => {
+  const base = createMemoryKeyStore();
+  let failNextPairingsWrite = false;
+  const keyStore = {
+    getItem: (key) => base.getItem(key),
+    removeItem: (key) => base.removeItem(key),
+    async setItem(key, value) {
+      if (key === 'relay_pairings' && failNextPairingsWrite) {
+        failNextPairingsWrite = false;
+        throw new Error('simulated store failure');
+      }
+      return base.setItem(key, value);
+    },
+  };
+  const mk = () => createPairing({ keyStore, transport: createMemoryTransportPair()[0] });
+  const owner = mk();
+  const id = await owner.storePairing('partner-1', 'root-key', 'relay:a:b');
+
+  failNextPairingsWrite = true;
+  const controllerA = mk();
+  const controllerB = mk();
+  const p1 = controllerA.updatePairingNickname(id, 'boom');
+  const p2 = controllerB.updatePairingNickname(id, 'ok');
+  await assert.rejects(() => p1, /simulated store failure/);
+  await p2;
+
+  const [rec] = await owner.getStoredPairings();
   assert.equal(rec.nickname, 'ok');
 });
 

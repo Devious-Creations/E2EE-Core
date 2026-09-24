@@ -20,7 +20,7 @@
 export function createLock() {
   let tail = Promise.resolve();
   return function withLock(fn) {
-    const next = tail.then(fn, fn);
+    const next = tail.then(() => fn(), () => fn());
     tail = next.catch(() => {});
     return next;
   };
