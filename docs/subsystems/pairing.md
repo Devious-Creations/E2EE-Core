@@ -1,4 +1,16 @@
-> **Verified against:** `91a4ad6` · 2026-09-24 · by coder
+> **Verified against:** the commit landing this doc change (built on
+> `c060403`) · 2026-09-24 · by coder
+> (adds the "Partner admission" section below for the new `admitPartner`
+> option, the `pair_abort` event, and `PARTNER_NOT_ADMITTED_ERROR`/
+> `PEER_REFUSED_ERROR` — every `src/pairing.js:NNN` anchor inside that new
+> section was checked against `src/pairing.js` as changed by this same commit.
+> This commit adds code throughout the file — not only where the new section
+> was inserted — so every OTHER section's pre-existing `src/pairing.js:NNN`
+> anchors, carried over unchanged from the `91a4ad6` pass below, are now
+> offset by the new lines and were NOT re-verified by this pass; re-read the
+> code before trusting them)
+>
+> **Prior stamp:** `91a4ad6` · 2026-09-24 · by coder
 > (re-read the whole file against this commit — PR #17 moved ~170 lines;
 > corrected ~25 stale `src/pairing.js:NNN` line anchors across every section
 > and the one test line ref; the lock-by-KeyStore fact was already correct)
@@ -155,6 +167,156 @@ callers did not — the distinction matters if you're diffing control flow.)
 protocol still runs unconditionally. Skipping the SAS because a caller
 verified `expectedCommit` would be a caller-side product decision — out of
 scope for this crypto core, and not something this change endorses.
+
+## Partner admission (`admitPartner`) — before anything is stored
+
+**Why this exists.** `storePairing` is never called until the caller shows
+the SAS and the user confirms it — but the consuming app enforces its own
+partner-limit policy *after* the handshake resolves, in its own
+`confirmPairing`. On a QR pairing the joiner auto-confirms, so an at-limit
+INITIATOR meeting a total stranger on a code still runs the whole handshake
+to completion: it derives a session, shows a SAS, and only refuses at its own
+confirm step — by which point the *joiner* has already auto-confirmed and
+stored a one-sided pairing that nothing but a Force purge removes. Moving the
+same "may I pair with this user?" question into the handshake itself, before
+either side ever reveals/responds, means a refusal aborts before either side
+gets far enough to store anything.
+
+**API shape and ordering.** `admitPartner?: (partnerUserId: string) =>
+(boolean | Promise<boolean>)` is accepted wherever `onCommit`/
+`expectedCommit` are — the same trailing options bag, validated at the same
+point, before any transport activity or key generation: an unknown option
+key (now including a misspelled `admitPartner`) is still rejected outright
+(`src/pairing.js:319-323`), and a present-but-non-function `admitPartner`
+throws immediately (`src/pairing.js:353-355`) the same way a malformed
+`onCommit`/`expectedCommit` already did.
+Each side calls it **exactly once**, with the locked partner's user id, as
+soon as that id is known and the existing per-message checks for that step
+have already passed — but strictly *before* this side's next message goes
+out:
+
+- **Joiner** (`pair_commit` handler): after `lockOrVerifyPartner` and the
+  QR `expectedCommit` check both pass, `partnerCommit` is recorded first (so
+  a later duplicate `pair_commit` carrying a *different* commit still hits
+  `CONTESTED_ERROR`, not a stale admission check), *then* `admitPartner` is
+  awaited — only on a `true` result does the joiner ever start its
+  `pair_response` repeat loop.
+- **Initiator** (`pair_response` handler): after `lockOrVerifyPartner` and
+  the public-key shape check both pass, `partnerPublicKey` is recorded first
+  (same CONTESTED-on-conflict reasoning), *then* `admitPartner` is awaited —
+  only on `true` does the initiator derive the session and ever send
+  `pair_reveal`. `onStateChange('exchanging')` on this path is deliberately
+  deferred to *after* admission, not before — a refusal never claims progress
+  it didn't make.
+
+**Per-handshake, per-side state machine:** `admission: 'none' | 'pending' |
+'admitted' | 'refused'`. `'none'` when no `admitPartner` was supplied at all
+(today's behaviour, exactly unchanged — no gate, no new event, no new state)
+or before the partner's identity is locked; `'pending'` while the call is
+in flight; `'admitted'` only on a result `=== true`; `'refused'` on anything
+else. **The admission check is strict fail-closed:** `false`, `undefined`,
+a truthy non-boolean, a synchronous throw, and a rejection are all treated
+identically — only exactly `true` admits.
+
+**While admission is pending or after it is refused, this side must not act
+on messages that assume the other side already admitted:**
+
+- A duplicate `pair_commit`/`pair_response` carrying the *same* value as the
+  one already locked is a silent no-op either way (nothing new to decide);
+  one carrying a *different* value still triggers `CONTESTED_ERROR`
+  regardless of admission state — the identity-lock check runs independently
+  of, and before, the admission gate.
+- The initiator's "duplicate response, resend `pair_reveal`" branch only
+  fires when `admission === 'admitted'` — otherwise it would leak the reveal
+  to a partner this side hasn't yet decided to pair with.
+- The joiner's `pair_reveal` handler and both sides' `pair_confirm` handler
+  are gated on `admission === 'admitted'` at their top and drop the message
+  otherwise — belt-and-suspenders, since neither message should arrive
+  before that point in the honest protocol, but a forged/duplicated one must
+  never be processed early regardless.
+- A resolution or rejection of the `admitPartner` promise that lands *after*
+  the handshake has already settled for an unrelated reason (cancel,
+  timeout, transport error, a contested-by-another-message abort) is a
+  no-op: the settled check runs immediately after the `await`, and the
+  rejection path is caught internally, so a late settle can neither revive
+  the handshake nor become an unhandled promise rejection.
+
+**Refusal, `pair_abort`, and the two new errors.** A refusal
+(`refuseAdmission`, `src/pairing.js:487-500`, called from
+`requestAdmission`, `src/pairing.js:514-535`) stops any in-flight repeat, then
+flushes **one** best-effort `pair_abort { userId, reason: 'not_admitted' }`
+to the peer — bounded exactly like the `#262` confirm flush (`Promise.race`
+against a single `REPEAT_MS` timer, so a stuck `send` can never hold this
+side open past one repeat interval) — and only then fails with
+`PARTNER_NOT_ADMITTED_ERROR` / `PARTNER_NOT_ADMITTED_CODE` (`src/pairing.js:
+143-163`, alongside `PEER_REFUSED_ERROR` / `PEER_REFUSED_CODE`) on the
+refusing side. **The no-store guarantee never depends on the abort arriving**: if it's
+lost, dropped, or ignored, the peer simply falls back to its own
+`PAIRING_TIMEOUT_MS` timeout, and neither side has stored anything either
+way — the abort is an optimisation for a faster, more specific rejection, not
+a correctness requirement.
+
+The side that *receives* a `pair_abort` and honours it fails with
+`PEER_REFUSED_ERROR` / `PEER_REFUSED_CODE` instead. Honouring is scoped as
+tightly as the protocol allows, since `pair_abort` is **unauthenticated** —
+it travels over the same untrusted transport as everything else, before any
+key material exists to sign or verify it with:
+
+- **Initiator:** before any `pair_response` has been accepted, *any* valid,
+  well-formed UUID that isn't its own id is honoured — no lock needed, the
+  same way an unlocked initiator already fails closed on a foreign
+  `pair_commit` today. Once a response has been accepted (a partner is
+  locked), only that locked partner's id is honoured, and only up to the
+  point the handshake settles.
+- **Joiner:** only from the locked initiator's id (`partnerId` — `null`
+  until `pair_commit` locks it, so nothing can match before that), and only
+  before a `pair_reveal` has been accepted.
+- Outside those windows the message is silently dropped. The handler
+  (`src/pairing.js:830-840`) never calls `lockOrVerifyPartner` (an abort must
+  not be able to lock or contest the handshake by itself) and never copies
+  `payload.reason` into the thrown error (it is untrusted free text). It also
+  works while *this* side's own admission is still pending or unresolved —
+  receiving a valid abort doesn't wait on anything else in flight.
+
+**`admitPartner` is a policy pre-check on a self-asserted id, not
+authentication.** At the point either side calls it, the only thing that's
+happened is `lockOrVerifyPartner` accepting a UUID that arrived over the
+untrusted transport — nothing has been cryptographically bound to that id
+yet (that only happens at the `pair_confirm` step's key-confirmation MACs,
+see "Key confirmation is bound to role and both identities" below).
+`admitPartner`'s job is app-level policy ("would I be willing to pair with
+this user id, assuming it's genuine?"), not identity verification — and
+because `PEER_REFUSED_ERROR` rides on that same unauthenticated signal,
+**its message text must stay neutral**: receiving it is not proof the named
+peer actually refused, only that something claiming to be on the other end
+of this handshake said so before either side had a key to authenticate that
+claim with. App-facing copy built on top of this error must not imply
+certainty it doesn't have.
+
+**The accepted one-bit oracle.** Whoever holds a pairing code or QR link
+learns exactly one bit either way: whether the app was willing to pair with
+*some* identity (their own, since a stranger has no other id to present at
+this stage) — win, and the handshake proceeds to the SAS step; lose, and it
+aborts with `PARTNER_NOT_ADMITTED_ERROR`/`PEER_REFUSED_ERROR` before a
+session ever exists. This is the same shape of exposure the confirm-time
+check already had (an app that later says "no room for another partner"
+tells the same one bit, later); moving the check earlier does not create a
+new information leak, it only closes the window where a refused stranger
+could still end up holding stored key material.
+
+**Old/new peer interop.** Neither `admitPartner` nor `pair_abort` change the
+wire protocol's other four message types, so an old peer (one built before
+this feature existed) still speaks steps 1–4 exactly as before — it just has
+no listener for `pair_abort` at all, and the transport drops an unknown
+event with no registered handler (`adapters/memoryTransport.js`; the app's
+real Realtime broadcast channel behaves the same way for an event nobody
+subscribed to). Concretely: an old joiner paired against a refusing new
+initiator never receives `pair_reveal` and times out; an old initiator paired
+against a refusing new joiner never receives `pair_response` and times out.
+Neither side stores in either case — **protection requires the REFUSING side
+to be running this code**; an old refusing side has no admission gate at all
+and simply completes the handshake as it always did. There is no way to make
+an old peer aware of a refusal it doesn't know how to listen for.
 
 ## Contested pairing is a fatal abort, by design — and not yet recoverable
 
@@ -368,3 +530,13 @@ not the handshake itself:
   key) — board #288 only retrofitted `CONTESTED_ERROR`/`TAMPERED_ERROR`
   alongside the existing `QR_COMMITMENT_MISMATCH_ERROR`; this is a deliberate
   scope line, not an oversight, and consumers still prose-match those.
+- No app-side wiring for `admitPartner` in this repo — this package only adds
+  the hook and the protocol-level `pair_abort`. The consuming app's own
+  partner-limit policy (what makes a partner "admissible") lives entirely on
+  the other side of that callback and is out of scope here; the app also
+  keeps its existing confirm-time check as a backstop, since a limit can
+  change mid-handshake.
+- No retry/renegotiation after a refusal — `PARTNER_NOT_ADMITTED_ERROR` and
+  `PEER_REFUSED_ERROR` are both terminal, fatal aborts, same as
+  `CONTESTED_ERROR`/`TAMPERED_ERROR`: a refused handshake does not revive,
+  the caller must start a fresh one with a new code.
