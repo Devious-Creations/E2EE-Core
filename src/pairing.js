@@ -53,6 +53,25 @@
 // with TODO comments; they are not part of the cryptographic handshake.
 
 import * as primitives from './primitives.js';
+import { createLock } from './asyncLock.js';
+
+// One lock per KeyStore object, not per controller. Consumers commonly build
+// a fresh `createPairing({ keyStore })` controller per call over ONE shared,
+// long-lived KeyStore (e.g. a module-level SecureStore adapter) — a lock
+// created inside createPairing would then serialize nothing, since every
+// call would get its own independent lock over the same underlying store.
+// Keying by the store object itself means every controller built over the
+// same store shares the same lock, however many controller instances exist.
+const pairingsLocksByStore = new WeakMap();
+
+function pairingsLockFor(keyStore) {
+  let lock = pairingsLocksByStore.get(keyStore);
+  if (!lock) {
+    lock = createLock();
+    pairingsLocksByStore.set(keyStore, lock);
+  }
+  return lock;
+}
 
 // ── Constants (verbatim from the app: relayConfig.js + pairingAuth.js) ────────
 
@@ -644,6 +663,20 @@ export function createPairing({ keyStore, transport } = {}) {
   // Shared keys stored separately: `pairing_key_${id}` → base64 key string.
   // Legacy single-partner keys are migrated on first read.
 
+  // One lock, one shared blob: every mutator below does
+  // read `relay_pairings` → modify the in-memory array → write it back, and
+  // all of them race on the SAME key (not per-pairing-id), so a single lock
+  // is correct — a lock keyed per pairing id would not stop two calls that
+  // touch different ids from still clobbering each other's write to the one
+  // shared array. One lock per `KeyStore` object, shared by every controller
+  // built over it — consumers may build a controller per call over one
+  // long-lived store, so the lock has to live at the store's granularity, not
+  // the controller's (see `pairingsLockFor` above). `readPairingsUnlocked`
+  // stays an UNLOCKED internal helper — it is only ever called from inside
+  // one of the locked functions below, which already holds the lock; taking
+  // it again here would deadlock against itself.
+  const withPairingsLock = pairingsLockFor(keyStore);
+
   /**
    * Migrate legacy single-partner KeyStore keys to the multi-partner format.
    * Runs once — after migration the old keys are removed.
@@ -675,10 +708,16 @@ export function createPairing({ keyStore, transport } = {}) {
   }
 
   /**
-   * Get all stored pairings.
+   * Read `relay_pairings`, migrating the legacy single-partner slots first if
+   * they are still present. INTERNAL — only for use inside a locked section
+   * (a mutator's own critical section already holds `withPairingsLock`, and
+   * calling the public `getStoredPairings` from there would deadlock against
+   * itself). `migrateLegacyPairing` re-checks the legacy key at its own top,
+   * so running it from here when a locked caller has already migrated is a
+   * no-op.
    * @returns {Promise<Array<{ id: string, partnerId: string, channelName: string }>>}
    */
-  async function getStoredPairings() {
+  async function readPairingsUnlocked() {
     await migrateLegacyPairing();
     const raw = await secureGet('relay_pairings');
     if (!raw) return [];
@@ -687,6 +726,20 @@ export function createPairing({ keyStore, transport } = {}) {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Get all stored pairings. Runs the legacy migration under the lock (only
+   * when legacy keys are actually present, so the common case pays no lock
+   * cost), then reads unlocked — the read itself doesn't need to be inside
+   * the lock, only the migration's write does.
+   * @returns {Promise<Array<{ id: string, partnerId: string, channelName: string }>>}
+   */
+  async function getStoredPairings() {
+    if (await secureGet('relay_partner_id')) {
+      await withPairingsLock(() => migrateLegacyPairing());
+    }
+    return readPairingsUnlocked();
   }
 
   /**
@@ -750,27 +803,29 @@ export function createPairing({ keyStore, transport } = {}) {
    * @returns {Promise<string>} the pairing ID
    */
   async function storePairing(partnerId, sharedKey, channelName) {
-    const id = await primitives.generateUUID();
+    return withPairingsLock(async () => {
+      const id = await primitives.generateUUID();
 
-    const pairings = await getStoredPairings();
-    // Prevent duplicate pairings with the same partner.
-    const existing = pairings.find((p) => p.partnerId === partnerId);
-    if (existing) {
-      // TODO(app coupling): re-pair rotation — clear the relay message queue and
-      // ratchet state for existing.channelName AND channelName BEFORE rotating
-      // the key. Dropped here (no ratchet/queue in this crypto core).
-      await secureSet(`pairing_key_${existing.id}`, sharedKey);
-      existing.channelName = channelName;
+      const pairings = await readPairingsUnlocked();
+      // Prevent duplicate pairings with the same partner.
+      const existing = pairings.find((p) => p.partnerId === partnerId);
+      if (existing) {
+        // TODO(app coupling): re-pair rotation — clear the relay message queue and
+        // ratchet state for existing.channelName AND channelName BEFORE rotating
+        // the key. Dropped here (no ratchet/queue in this crypto core).
+        await secureSet(`pairing_key_${existing.id}`, sharedKey);
+        existing.channelName = channelName;
+        await secureSet('relay_pairings', JSON.stringify(pairings));
+        await setActivePartnerId(existing.id);
+        return existing.id;
+      }
+
+      pairings.push({ id, partnerId, channelName });
       await secureSet('relay_pairings', JSON.stringify(pairings));
-      await setActivePartnerId(existing.id);
-      return existing.id;
-    }
-
-    pairings.push({ id, partnerId, channelName });
-    await secureSet('relay_pairings', JSON.stringify(pairings));
-    await secureSet(`pairing_key_${id}`, sharedKey);
-    await setActivePartnerId(id);
-    return id;
+      await secureSet(`pairing_key_${id}`, sharedKey);
+      await setActivePartnerId(id);
+      return id;
+    });
   }
 
   /**
@@ -779,11 +834,13 @@ export function createPairing({ keyStore, transport } = {}) {
    * @param {string} dynamicId
    */
   async function setPairingDynamicId(pairingId, dynamicId) {
-    const pairings = await getStoredPairings();
-    const rec = pairings.find((p) => p.id === pairingId);
-    if (!rec) return;
-    rec.dynamicId = dynamicId;
-    await secureSet('relay_pairings', JSON.stringify(pairings));
+    return withPairingsLock(async () => {
+      const pairings = await readPairingsUnlocked();
+      const rec = pairings.find((p) => p.id === pairingId);
+      if (!rec) return;
+      rec.dynamicId = dynamicId;
+      await secureSet('relay_pairings', JSON.stringify(pairings));
+    });
   }
 
   /**
@@ -792,11 +849,13 @@ export function createPairing({ keyStore, transport } = {}) {
    * @param {string|null} nickname
    */
   async function updatePairingNickname(pairingId, nickname) {
-    const pairings = await getStoredPairings();
-    const entry = pairings.find((p) => p.id === pairingId);
-    if (!entry) return;
-    entry.nickname = nickname || null;
-    await secureSet('relay_pairings', JSON.stringify(pairings));
+    return withPairingsLock(async () => {
+      const pairings = await readPairingsUnlocked();
+      const entry = pairings.find((p) => p.id === pairingId);
+      if (!entry) return;
+      entry.nickname = nickname || null;
+      await secureSet('relay_pairings', JSON.stringify(pairings));
+    });
   }
 
   /**
@@ -809,20 +868,22 @@ export function createPairing({ keyStore, transport } = {}) {
    * @param {string} pairingId
    */
   async function removePairing(pairingId) {
-    const pairings = await getStoredPairings();
-    const updated = pairings.filter((p) => p.id !== pairingId);
-    await secureSet('relay_pairings', JSON.stringify(updated));
-    await secureDelete(`pairing_key_${pairingId}`);
+    return withPairingsLock(async () => {
+      const pairings = await readPairingsUnlocked();
+      const updated = pairings.filter((p) => p.id !== pairingId);
+      await secureSet('relay_pairings', JSON.stringify(updated));
+      await secureDelete(`pairing_key_${pairingId}`);
 
-    // If we removed the active partner, switch to the next available.
-    const activeId = await getActivePartnerId();
-    if (activeId === pairingId) {
-      if (updated.length > 0) {
-        await setActivePartnerId(updated[0].id);
-      } else {
-        await secureDelete('relay_active_partner');
+      // If we removed the active partner, switch to the next available.
+      const activeId = await getActivePartnerId();
+      if (activeId === pairingId) {
+        if (updated.length > 0) {
+          await setActivePartnerId(updated[0].id);
+        } else {
+          await secureDelete('relay_active_partner');
+        }
       }
-    }
+    });
   }
 
   /**
@@ -833,17 +894,19 @@ export function createPairing({ keyStore, transport } = {}) {
    * relay/transport layer, not this crypto core.
    */
   async function clearPairing() {
-    const pairings = await getStoredPairings();
-    for (const p of pairings) {
-      await secureDelete(`pairing_key_${p.id}`);
-    }
-    await secureDelete('relay_pairings');
-    await secureDelete('relay_active_partner');
+    return withPairingsLock(async () => {
+      const pairings = await readPairingsUnlocked();
+      for (const p of pairings) {
+        await secureDelete(`pairing_key_${p.id}`);
+      }
+      await secureDelete('relay_pairings');
+      await secureDelete('relay_active_partner');
 
-    // Also clean up any remaining legacy keys.
-    await secureDelete('relay_partner_id');
-    await secureDelete('relay_shared_key');
-    await secureDelete('relay_channel_name');
+      // Also clean up any remaining legacy keys.
+      await secureDelete('relay_partner_id');
+      await secureDelete('relay_shared_key');
+      await secureDelete('relay_channel_name');
+    });
   }
 
   return {
