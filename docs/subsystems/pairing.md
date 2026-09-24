@@ -1,4 +1,4 @@
-> **Verified against:** `79069b8` · 2026-08-03 · by fable
+> **Verified against:** `fe8b762` · 2026-09-24 · by coder
 
 # Pairing — the X25519 + SAS handshake
 
@@ -249,6 +249,36 @@ only means keys are exchanged and confirmed; the caller must still show the
 SAS for explicit human comparison and only then call `storePairing`
 (`src/pairing.js:12-13, 155-159`).
 
+**Every `relay_pairings` read-modify-write runs under one lock.**
+`storePairing`, `setPairingDynamicId`, `updatePairingNickname`,
+`removePairing`, and `clearPairing` each do read the JSON array → mutate it
+in memory → write it back; without coordination, two of those calls running
+concurrently on the same controller (e.g. a background dynamic-id resolve
+racing a user-triggered nickname rename) can interleave their read and write
+so one call's change is silently overwritten by the other's stale copy of
+the array. `createPairing` now closes over one `withPairingsLock` (built with
+the small promise-chain mutex in `./asyncLock.js`, the same shape
+`ratchet.js`'s own `withLock` already uses) and every mutator above runs its
+whole read-modify-write inside it, so calls on the same controller queue
+instead of interleaving. **One constant key, not one per pairing id** — all
+five/six mutators share the single `relay_pairings` blob regardless of which
+pairing they touch, so keying the lock by pairing id would not have closed
+the race (two calls touching *different* ids still clobber the one shared
+array). The lock is scoped to the `createPairing` factory instance, matching
+the store it guards — two separate controllers (two separate `KeyStore`s)
+never share a lock, and don't need to. `getStoredPairings` and
+`migrateLegacyPairing` stay **unlocked**: they are the read step, called
+either directly (a plain getter) or from inside an already-locked mutator,
+where taking the lock again would deadlock against itself. `relay_active_partner`
+is not covered by this lock (no interleave against it was found to break it) —
+each mutator that touches it (`storePairing`, `removePairing`) does so from
+inside its own already-locked section, so calls into those specific paths are
+still serialized as a side effect, but a caller invoking `setActivePartnerId`
+directly, concurrently with one of the locked mutators, is not synchronized
+against it. **In-process only**: this is a single JS-runtime lock, not a
+cross-process one — two separate app processes (or two tabs/workers) writing
+the same underlying storage are not serialized by it.
+
 ## Traps
 
 **Re-pairing an existing partner overwrites `pairing_key_<id>` in place**
@@ -262,6 +292,15 @@ key slot**, never the ratchet's own storage keys (`relay_ratchet_*`, owned by
 `ratchet.js`). A consumer that runs the ratchet must clear that state itself
 on unpair/re-pair rotation — this module cannot do it because it has no
 reference to a ratchet instance.
+
+**The `relay_pairings` lock does not extend to `relay_active_partner`.**
+`setActivePartnerId`/`getActivePartnerId` are plain unlocked reads/writes; a
+caller that calls `setActivePartnerId` directly while a locked mutator
+(`storePairing`/`removePairing`) is also updating the active partner from
+inside its own critical section can still race that specific key. No
+concurrent-in-practice caller of `setActivePartnerId` on its own was found,
+so this was deliberately left out of scope rather than folded into the same
+lock — see "Storage this module owns" above.
 
 ## Deliberately dropped app coupling (not a regression — a stated boundary)
 

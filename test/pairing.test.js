@@ -156,6 +156,83 @@ test('clearPairing + removePairing wipe the stored root key', async () => {
   assert.deepEqual(await A.getStoredPairings(), []);
 });
 
+// ── relay_pairings read-modify-write race ─────────────────────────────────────
+// The five stored-pairing mutators (plus `clearPairing`) all do a plain
+// read `relay_pairings` → modify the in-memory array → write it back with no
+// coordination between calls. Two of the app's flows fire these concurrently
+// against the SAME stored blob (a background dynamic-id resolve racing a
+// user-triggered nickname rename), so an interleaved pair of calls can
+// silently drop one side's change. `createDelayedKeyStore` below inserts a
+// macrotask yield on every KeyStore op so two concurrent calls are forced to
+// interleave their read/write steps instead of happening to run atomically
+// back-to-back — without it, this race would only fail intermittently.
+function createDelayedKeyStore() {
+  const base = createMemoryKeyStore();
+  const yieldTick = () => new Promise((resolve) => setImmediate(resolve));
+  return {
+    async getItem(key) {
+      await yieldTick();
+      return base.getItem(key);
+    },
+    async setItem(key, value) {
+      await yieldTick();
+      return base.setItem(key, value);
+    },
+    async removeItem(key) {
+      await yieldTick();
+      return base.removeItem(key);
+    },
+  };
+}
+
+test('relay_pairings race: concurrent dynamicId + nickname writes both survive', async () => {
+  const keyStore = createDelayedKeyStore();
+  const controller = createPairing({ keyStore, transport: createMemoryTransportPair()[0] });
+  const id = await controller.storePairing('partner-1', 'root-key', 'relay:a:b');
+
+  // Same shared `relay_pairings` blob, two unrelated fields, fired together —
+  // this is exactly the background-provisioning-vs-rename interleave.
+  await Promise.all([
+    controller.setPairingDynamicId(id, 'dynamic-123'),
+    controller.updatePairingNickname(id, 'Partner Nickname'),
+  ]);
+
+  const [rec] = await controller.getStoredPairings();
+  assert.equal(rec.dynamicId, 'dynamic-123', 'the dynamicId write must not be lost to the interleave');
+  assert.equal(rec.nickname, 'Partner Nickname', 'the nickname write must not be lost to the interleave');
+});
+
+test('relay_pairings lock: a mutator that throws does not wedge the next one', async () => {
+  const base = createMemoryKeyStore();
+  let failNextPairingsWrite = false;
+  const keyStore = {
+    getItem: (key) => base.getItem(key),
+    removeItem: (key) => base.removeItem(key),
+    async setItem(key, value) {
+      if (key === 'relay_pairings' && failNextPairingsWrite) {
+        failNextPairingsWrite = false;
+        throw new Error('simulated store failure');
+      }
+      return base.setItem(key, value);
+    },
+  };
+  const controller = createPairing({ keyStore, transport: createMemoryTransportPair()[0] });
+  const id = await controller.storePairing('partner-1', 'root-key', 'relay:a:b');
+
+  failNextPairingsWrite = true;
+  await assert.rejects(
+    () => controller.updatePairingNickname(id, 'boom'),
+    /simulated store failure/,
+    'the failing mutator itself must still reject',
+  );
+
+  // The lock must not be left held by the failed critical section — a later
+  // mutator has to complete normally, not hang or inherit the rejection.
+  await controller.updatePairingNickname(id, 'ok');
+  const [rec] = await controller.getStoredPairings();
+  assert.equal(rec.nickname, 'ok');
+});
+
 test('generatePairingCode: WORD-WORD-NNNN shape from the known word list', async () => {
   const { generatePairingCode } = createPairing({
     keyStore: createMemoryKeyStore(),
