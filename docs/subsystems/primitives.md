@@ -1,4 +1,8 @@
-> **Verified against:** branch `fix/scrypt-async-tick` (uncommitted at time of writing) · 2026-08-02 · by fable
+> **Verified against:** `91a4ad6` · 2026-09-24 · by coder
+> (re-read `src/primitives.js` in full against this commit — untouched since
+> the prior stamp landed as `8044ba2`; every line anchor checked, no drift)
+>
+> **Prior stamp:** branch `fix/scrypt-async-tick` (uncommitted at time of writing) · 2026-08-02 · by fable
 
 # Primitives — the audited-library wrapper
 

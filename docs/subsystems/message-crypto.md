@@ -1,4 +1,9 @@
-> **Verified against:** `e2235f5` · 2026-07-30 · by coder (#142 backfill)
+> **Verified against:** `91a4ad6` · 2026-09-24 · by coder
+> (re-read `ratchet.js`/`sealing.js` in full — unchanged since the prior
+> stamp, all anchors still accurate; fixed one stale `pairing.js` anchor after
+> PR #17's storePairing move: 588-610 → 805-829)
+>
+> **Prior stamp:** `e2235f5` · 2026-07-30 · by coder (#142 backfill)
 
 # Message crypto — the relay ratchet and sealing primitives
 
@@ -54,7 +59,7 @@ key (`ck_n`) after each step only protects against an attacker who recovers a
 chain key *in isolation*. That is not the threat that matters, because:
 
 - The root, `K_pair`, is retained verbatim at rest — `storePairing` writes it
-  to `pairing_key_<id>` (`src/pairing.js:588-610`) and it is never deleted
+  to `pairing_key_<id>` (`src/pairing.js:805-829`) and it is never deleted
   except by an explicit unpair/purge.
 - `loadState`/`initState` deterministically re-derive **both** chains from
   counter 0 given only that root (`src/ratchet.js:116-127, 221-234`) — there

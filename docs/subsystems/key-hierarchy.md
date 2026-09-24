@@ -1,4 +1,9 @@
-> **Verified against:** branch `fix/unwrap-fault-dynamic-id` · 2026-08-16 · by coder
+> **Verified against:** `91a4ad6` · 2026-09-24 · by coder
+> (re-read `dynamicKeys.js`/`keyVault.js`/`interfaces.js` and every line anchor
+> in this doc against them; no commit touched these files since the prior
+> stamp and no drift found)
+>
+> **Prior stamp:** branch `fix/unwrap-fault-dynamic-id` · 2026-08-16 · by coder
 > (every `src/dynamicKeys.js` line anchor in this doc was re-verified against
 > the file at that commit, after the `onUnwrapFault` JSDoc's +5 lines shifted
 > them; supersedes the `cdf75b4` · 2026-08-08 stamp — `main` gained no code
