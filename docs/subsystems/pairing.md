@@ -1,4 +1,9 @@
-> **Verified against:** `ad085f1` · 2026-09-24 · by coder
+> **Verified against:** `91a4ad6` · 2026-09-24 · by coder
+> (re-read the whole file against this commit — PR #17 moved ~170 lines;
+> corrected ~25 stale `src/pairing.js:NNN` line anchors across every section
+> and the one test line ref; the lock-by-KeyStore fact was already correct)
+>
+> **Prior stamp:** `ad085f1` · 2026-09-24 · by coder
 > (only the "Storage this module owns" section's `src/pairing.js:NNN` line
 > anchors were re-verified against the file at this commit, since that is the
 > section this pass changed; the rest of the doc's line anchors were not
@@ -24,7 +29,7 @@ implies no machine-in-the-middle. The five-step protocol
 (`src/pairing.js:15-22`) — commit, response, reveal, confirm, SAS — exists
 specifically so a MITM cannot grind its own keypair after seeing the other
 side's public key to force a matching SAS (`src/pairing.js:24-28,
-288-291`).
+421-424`).
 
 ## Out-of-band commitment delivery (QR path) — board #233
 
@@ -52,14 +57,14 @@ await pairing.initiatePairing(code, userId, onStateChange, { onCommit });
 await pairing.joinPairing(code, userId, onStateChange, { expectedCommit });
 ```
 
-(`src/pairing.js:193-221`, threaded into `performHandshake(code, userId, role,
-onStateChange, options)` at `src/pairing.js:234-235`.) Consumers pin this
+(`src/pairing.js:223-252`, threaded into `performHandshake(code, userId, role,
+onStateChange, options)` at `src/pairing.js:253-254`.) Consumers pin this
 package to an exact commit, so no released consumer used these hooks yet when
 they were introduced — the API was still free to move. That window closes the
 moment a consumer bumps its pin to a commit containing them.
 
 **Both options are validated up front, before anything else runs**
-(`src/pairing.js:235-269`): `onCommit` (if present) must be a function,
+(`src/pairing.js:259-288`): `onCommit` (if present) must be a function,
 `expectedCommit` (if present) must be a base64-encoded 32-byte digest (shape
 checked, so a base64url or truncated value from a QR round-trip is the
 caller's bug, not a user-facing attack warning), and an unrecognised option
@@ -76,12 +81,12 @@ to the caller that anything was wrong — and a wrong-typed `expectedCommit`
 render an attack warning for what is actually a programmer bug. Both are now
 a loud, immediate rejection instead.
 
-- **`onCommit`** (`src/pairing.js:263-284`): called once with the base64
+- **`onCommit`** (`src/pairing.js:312-333`): called once with the base64
   commitment (`sha256(pk_I)`) the instant it's computed, on the initiator
   path only, before the `pair_commit` broadcast loop starts — so the caller
   can render it into a QR. It is called inside a `try/catch`, and if it
   returns a thenable, a no-op rejection handler is attached to that too
-  (`src/pairing.js:277-279`): an **async** `onCommit` that later rejects would
+  (`src/pairing.js:326-329`): an **async** `onCommit` that later rejects would
   otherwise become an unhandled promise rejection, which under Node's default
   terminates the process — and QR rendering is exactly the kind of thing a
   caller writes as `async`. Precisely: a throwing or slow **synchronous**
@@ -92,7 +97,7 @@ a loud, immediate rejection instead.
   such guard today; this is a deliberately *stricter* treatment for the new
   hook, not a mirror of an existing one. The joiner never receives `onCommit`
   — it is gated on `role === 'initiator'`.
-- **`expectedCommit`** (`src/pairing.js:477-484, 559-566`): the base64 commitment
+- **`expectedCommit`** (`src/pairing.js:496-503, 578-585`): the base64 commitment
   obtained out-of-band (e.g. scanned from the initiator's QR), in the SAME
   encoding `primitives.encodeBase64` produces (standard RFC 4648 base64 WITH
   padding — this package does **not** accept base64url (`-`/`_`) or
@@ -103,7 +108,7 @@ a loud, immediate rejection instead.
   that conversion for you.
 
   When present:
-  1. **Commit-stage gate, the PRIMARY defence** (`src/pairing.js:477-484`): on
+  1. **Commit-stage gate, the PRIMARY defence** (`src/pairing.js:496-503`): on
      `pair_commit`, the wire's commit is decoded and byte-compared (via
      `timingSafeEqual`, reusing the already-decoded `commitBytes` — not a raw
      string compare, since an equivalent re-encoding of the same digest is
@@ -115,7 +120,7 @@ a loud, immediate rejection instead.
      reaches `pair_reveal` at all. **This gate must never be removed as a mere
      "fail-fast nicety"** — it is not redundant with the reveal-stage check
      below.
-  2. **Reveal-stage re-hash, defence-in-depth** (`src/pairing.js:559-566`): on
+  2. **Reveal-stage re-hash, defence-in-depth** (`src/pairing.js:578-585`): on
      `pair_reveal`, the revealed key is independently re-hashed and checked
      against `expectedCommit` directly — never against the already-stored,
      wire-derived `partnerCommit`. This exists to preserve the same guarantee,
@@ -124,15 +129,15 @@ a loud, immediate rejection instead.
      or bypassed** — it is not the primary mechanism and must not be relied on
      alone.
   3. Either mismatch is a hard, fatal, non-recoverable abort with the new
-     `QR_COMMITMENT_MISMATCH_ERROR` message (`src/pairing.js:88-90`) — no
+     `QR_COMMITMENT_MISMATCH_ERROR` message (`src/pairing.js:107-109`) — no
      retry, no fallback path, no session ever derived, no `sharedKey` ever
      returned. The thrown `Error` also carries `err.code ===
-     'QR_COMMITMENT_MISMATCH'` (`src/pairing.js:92-97`, via an optional 2nd
+     'QR_COMMITMENT_MISMATCH'` (`src/pairing.js:111-116`, via an optional 2nd
      arg accepted by the internal `fail()` helper) — this was the file's
      **first** exported pairing error, and set the precedent: `CONTESTED_ERROR`
      and `TAMPERED_ERROR` are now exported the same way, each with its own
      stable `err.code` (`CONTESTED_CODE = 'CONTESTED'`, `TAMPERED_CODE =
-     'TAMPERED'`, `src/pairing.js:65-81`), attached at every `fail(...)` call
+     'TAMPERED'`, `src/pairing.js:90-100`), attached at every `fail(...)` call
      site that throws them. Callers should branch on `err.code`, not on
      message text, for all three — message text itself is unchanged, so
      existing callers still matching on it are unaffected (board #288).
@@ -157,17 +162,17 @@ scope for this crypto core, and not something this change endorses.
 revives, for the lifetime of that `performHandshake` call:**
 
 1. A second, different partner id answers after the first has locked in
-   (`lockOrVerifyPartner`, `src/pairing.js:389-400`, called from the
+   (`lockOrVerifyPartner`, `src/pairing.js:408-419`, called from the
    `pair_commit`/`pair_response`/`pair_reveal`/`pair_confirm` handlers at
-   lines 449, 501, 532, 591).
+   lines 468, 520, 551, 610).
 2. A duplicate `pair_commit` whose committed value differs from the one
-   already locked (`src/pairing.js:488-490`).
+   already locked (`src/pairing.js:507-509`).
 3. A duplicate `pair_response` whose public key differs from the one already
-   locked (`src/pairing.js:502-510`, the branch that is NOT the same-key
+   locked (`src/pairing.js:521-528`, the branch that is NOT the same-key
    "resend" case).
 
-All three call `fail(CONTESTED_ERROR, CONTESTED_CODE)` (`src/pairing.js:72-73,
-79`, `348` for `fail()` itself), so the rejected error carries both the
+All three call `fail(CONTESTED_ERROR, CONTESTED_CODE)` (`src/pairing.js:91-92,
+98`, `367` for `fail()` itself), so the rejected error carries both the
 message and `err.code === 'CONTESTED'` (board #288). Calling `fail()` also
 sets the closure-scoped `settled` flag, tears the handshake down
 (`cleanup()` — clears timers and closes the transport), and rejects the
@@ -175,9 +180,9 @@ promise. Every event handler in `performHandshake` checks `settled` at its
 top or via `lockOrVerifyPartner`'s own guard, so a message arriving after
 `fail()` — even a well-formed, correctly-signed one from the *original*
 locked partner — is silently dropped, not processed
-(`src/pairing.js:328-453`, the `if (settled ...) return;` guards on every
+(`src/pairing.js:461-636`, the `if (settled ...) return;` guards on every
 handler). **There is no path back to `pending`/`exchanging` once `settled` is
-true.** `test/pairing.test.js:218-303` pins exactly this: it crafts a
+true.** `test/pairing.test.js:421-451` pins exactly this: it crafts a
 post-abort message from the originally-locked partner and asserts no further
 `onStateChange` call occurs.
 
@@ -202,40 +207,40 @@ guessed-code attacker more tries against the same code before it expires).
 ## Invariants
 
 **The pairing code is a rendezvous identifier, not a trust anchor**
-(`src/pairing.js:86-91`). Trust comes entirely from the SAS comparison after
+(`src/pairing.js:133-139`). Trust comes entirely from the SAS comparison after
 the committed exchange. The code space (two words + four digits ≈ 23M
-combinations, `PAIRING_WORDS` at `src/pairing.js:73-80`) exists to make
+combinations, `PAIRING_WORDS` at `src/pairing.js:121-128`) exists to make
 online guessing of an *active* rendezvous statistically dead within the
-120-second `PAIRING_TIMEOUT_MS` window (`src/pairing.js:59-60`), referencing
+120-second `PAIRING_TIMEOUT_MS` window (`src/pairing.js:79`), referencing
 DeviousByDC#433 where the older WORD-NNNN space (480k) was judged too small.
 
 **The ephemeral keypair never touches the `KeyStore`.** It lives only in the
-`performHandshake` closure (`src/pairing.js:193-199`), so two concurrent
+`performHandshake` closure (`src/pairing.js:301-307`), so two concurrent
 handshake attempts on the same controller can never cross-derive by sharing
 a stored secret slot.
 
 **Only one handshake is live per controller.** `cancelActiveHandshake`
-(`src/pairing.js:149-153`) aborts any previous in-flight attempt before a new
-one starts (`src/pairing.js:185`), so an abandoned handshake cannot hold its
+(`src/pairing.js:197-201`) aborts any previous in-flight attempt before a new
+one starts (`src/pairing.js:293`), so an abandoned handshake cannot hold its
 transport subscribed for the full timeout, nor reject minutes later into a
 newer attempt's UI state.
 
 **The revealed key must match its earlier commitment, checked with
 constant-time comparison.** The joiner verifies
 `sha256(revealed_pk) == commit` via `primitives.timingSafeEqual`
-(`src/pairing.js:569-574`) before deriving a session from it — an initiator
+(`src/pairing.js:586-593`) before deriving a session from it — an initiator
 that reveals a key different from what it committed to is treated as
 tampering (`TAMPERED_ERROR`, `err.code === 'TAMPERED'`), not as a protocol
 variance.
 
 **Key confirmation is bound to role and both identities.** `confirmMac`
-(`src/pairing.js:308-311`) HMACs `role|initiatorId|joinerId` under the
+(`src/pairing.js:439-444`) HMACs `role|initiatorId|joinerId` under the
 derived shared key, so a swapped or replayed confirm from the wrong role or
-wrong pair fails `verifyConfirm` (`src/pairing.js:313-321`) and the handshake
+wrong pair fails `verifyConfirm` (`src/pairing.js:446-454`) and the handshake
 fails closed before either side trusts the shared key.
 
 **The initiator's final confirm is awaited before teardown.** `#262`
-(`src/pairing.js:442-448`): sending the last `pair_confirm` is awaited before
+(`src/pairing.js:618-631`): sending the last `pair_confirm` is awaited before
 `succeed()` runs `cleanup()` → `transport.close()`, because an unawaited send
 raced against teardown could drop that one message — leaving the joiner to
 time out while the initiator has already shown its SAS and stored its side
@@ -252,7 +257,7 @@ single-partner slots migrated once on first read
 `storePairing`, not at handshake success** — `performHandshake` resolving
 only means keys are exchanged and confirmed; the caller must still show the
 SAS for explicit human comparison and only then call `storePairing`
-(`src/pairing.js:12-13, 155-159`).
+(`src/pairing.js:12-13, 204-207`).
 
 **Every `relay_pairings` read-modify-write runs under one lock, keyed by the
 `KeyStore` object, not by controller.** Five mutators —
