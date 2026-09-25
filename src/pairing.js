@@ -14,14 +14,17 @@
 //
 // Protocol v2 (committed key exchange with SAS verification):
 //   1. initiator → pair_commit   { userId, commit: sha256(pk_I) }
-//   1b. each side, once it locks the OTHER's identity from the message above
-//      (before responding/revealing) — optionally asks the caller's app
-//      `options.admitPartner(partnerUserId)`; a refusal on either side sends
-//      one best-effort pair_abort and aborts THAT side before it ever
-//      reveals/responds, so a partner it wouldn't admit never gets far
-//      enough to leave a one-sided pairing on the other end. Omitted:
-//      today's behaviour, unchanged (see "Partner admission" below).
+//   1b. joiner admits: once pair_commit locks the initiator's identity, and
+//      before it responds, it optionally asks the caller's app
+//      `options.admitPartner(initiatorUserId)`.
 //   2. joiner    → pair_response { userId, publicKey: pk_J }
+//   2b. initiator admits: once pair_response locks the joiner's identity,
+//      and before it reveals, it optionally asks
+//      `options.admitPartner(joinerUserId)`.
+//      A refusal at 1b/2b sends one best-effort pair_abort and aborts THAT
+//      side before its next message, so a partner it wouldn't admit never
+//      gets far enough to leave a one-sided pairing on the other end.
+//      Omitted: today's behaviour, unchanged (see "Partner admission" below).
 //   3. initiator → pair_reveal   { userId, publicKey: pk_I }   (joiner checks the commitment)
 //   4. both      → pair_confirm  { userId, mac: HMAC(K, role|ids) }  (key confirmation)
 //   5. both devices display a 6-digit SAS derived from the transcript; the user
@@ -353,6 +356,7 @@ export function createPairing({ keyStore, transport } = {}) {
     if (admitPartner !== undefined && typeof admitPartner !== 'function') {
       throw new Error('[pairing] options.admitPartner must be a function');
     }
+    const hasAdmission = admitPartner !== undefined;
 
     if (!transport || typeof transport.send !== 'function' || typeof transport.on !== 'function') {
       throw new Error('[pairing] a handshake requires a Transport { send, on, close }');
@@ -419,13 +423,14 @@ export function createPairing({ keyStore, transport } = {}) {
       let partnerPublicKey = null; // base64, set at response (initiator) / reveal (joiner)
       let session = null; // { sharedKeyBase64, sharedKeyBytes, sas }
       // Per-handshake, per-side admission state (see options.admitPartner
-      // above). 'none' when no admitPartner was supplied (today's behaviour,
-      // unchanged) or before the partner's identity is known; 'pending' while
-      // admitPartner is being awaited; 'admitted' only on a `=== true`
+      // above). Without an admitPartner it starts, and stays, 'admitted', so
+      // every admission gate below is a no-op (today's behaviour, unchanged).
+      // With one: 'none' until the partner's identity is locked; 'pending'
+      // while admitPartner is being awaited; 'admitted' only on a `=== true`
       // result; 'refused' on anything else (fail-closed default), which is
       // terminal — refusal always leads to fail() below, so admission never
       // moves out of 'refused' once set.
-      let admission = 'none';
+      let admission = hasAdmission ? 'none' : 'admitted';
 
       // channel.send({type:'broadcast', event, payload}) → transport.send(event, payload).
       // The transport broadcasts to the OTHER party only (never echoed back).
@@ -467,6 +472,10 @@ export function createPairing({ keyStore, transport } = {}) {
       function startRepeat(fn) {
         if (repeatTimer) clearInterval(repeatTimer);
         fn();
+        // The first send can settle the handshake synchronously (a transport
+        // that delivers or errors inside send); cleanup() has then already
+        // run, so an interval created now would never be cleared.
+        if (settled) return;
         repeatTimer = setInterval(() => {
           if (!settled) fn();
         }, REPEAT_MS);
@@ -502,20 +511,20 @@ export function createPairing({ keyStore, transport } = {}) {
       }
 
       // Ask the caller's app whether it's OK to pair with the locked partner
-      // BEFORE this side reveals/responds — called exactly once per side per
-      // handshake (only from the two call sites below, each already guarded
-      // to run once). Admits ONLY on a `=== true` result; `false`,
-      // `undefined`, a truthy non-boolean, a synchronous throw, or a
-      // rejection all refuse (fail closed). No `admitPartner` at all ⇒
-      // 'admitted' immediately — today's behaviour, unchanged. Resolves
-      // `true` (admitted, caller should proceed) or `false` (refused or the
-      // handshake settled for an unrelated reason while this was pending —
-      // either way the caller must stop, never send the next message).
+      // BEFORE this side reveals/responds. Only called when an admitPartner
+      // was supplied, and asks it at most once per side per handshake: two
+      // duplicate messages delivered in the same tick can both reach a call
+      // site before either await finishes, so the second call must return
+      // `false` here without asking again — otherwise a second answer could
+      // overtake a refusal whose abort is still being flushed. Admits ONLY
+      // on a `=== true` result; `false`, `undefined`, a truthy non-boolean,
+      // a synchronous throw, or a rejection all refuse (fail closed).
+      // Resolves `true` (admitted, caller should proceed) or `false`
+      // (refused, already asked, or the handshake settled for an unrelated
+      // reason while this was pending — either way the caller must stop,
+      // never send the next message).
       async function requestAdmission() {
-        if (typeof admitPartner !== 'function') {
-          admission = 'admitted';
-          return true;
-        }
+        if (admission !== 'none') return false;
         admission = 'pending';
         let admitted;
         try {
@@ -529,7 +538,7 @@ export function createPairing({ keyStore, transport } = {}) {
         // must have no effect: no second settle, and — since the `try` above
         // already converted a rejection into `admitted = false` — no
         // unhandled rejection either.
-        if (settled) return false;
+        if (settled || admission === 'refused') return false;
         if (admitted === true) {
           admission = 'admitted';
           return true;
@@ -632,6 +641,15 @@ export function createPairing({ keyStore, transport } = {}) {
           if (expectedCommit !== undefined) {
             const expectedCommitBytes = await decode32(expectedCommit);
             if (settled) return;
+            // A duplicate pair_commit delivered in the same tick passed the
+            // `partnerCommit === null` check above before this await
+            // finished; whichever copy resumes second must not record the
+            // commit again (or ask for admission again) — treat it exactly
+            // like the duplicate/contested branch below.
+            if (partnerCommit !== null) {
+              if (partnerCommit !== payload.commit) fail(CONTESTED_ERROR, CONTESTED_CODE);
+              return;
+            }
             if (!expectedCommitBytes || !primitives.timingSafeEqual(commitBytes, expectedCommitBytes)) {
               fail(QR_COMMITMENT_MISMATCH_ERROR, QR_COMMITMENT_MISMATCH_CODE);
               return;
@@ -645,8 +663,10 @@ export function createPairing({ keyStore, transport } = {}) {
           // the SAME commit falls through to "already responding" below (a
           // no-op, since partnerCommit is already set); one carrying a
           // DIFFERENT commit still hits the CONTESTED branch just below.
-          const admitted = await requestAdmission();
-          if (!admitted) return;
+          if (hasAdmission) {
+            const admitted = await requestAdmission();
+            if (!admitted || settled) return;
+          }
           // Repeat our response until the initiator reveals its key.
           startRepeat(() => send('pair_response', { publicKey: myPublicKey }));
         } else if (partnerCommit !== payload.commit) {
@@ -678,6 +698,16 @@ export function createPairing({ keyStore, transport } = {}) {
         }
         const pkBytes = await decode32(payload.publicKey);
         if (settled) return;
+        // A duplicate pair_response delivered in the same tick passed the
+        // `partnerPublicKey !== null` check above before this await
+        // finished; whichever copy resumes second must not record the key
+        // again (or ask for admission again) — treat it exactly like the
+        // duplicate/contested branch above, minus the reveal resend (the
+        // first copy is still on its way to sending the reveal itself).
+        if (partnerPublicKey !== null) {
+          if (payload.publicKey !== partnerPublicKey) fail(CONTESTED_ERROR, CONTESTED_CODE);
+          return;
+        }
         if (!pkBytes) {
           fail(TAMPERED_ERROR, TAMPERED_CODE);
           return;
@@ -687,8 +717,11 @@ export function createPairing({ keyStore, transport } = {}) {
         // Ask the app whether pairing with this (now-locked) partner is
         // allowed BEFORE we ever reveal our key — a refusal here means the
         // initiator never reveals to a partner it wouldn't admit.
-        const admitted = await requestAdmission();
-        if (!admitted) return;
+        if (hasAdmission) {
+          const admitted = await requestAdmission();
+          if (!admitted) return;
+        }
+        if (settled) return;
         onStateChange('exchanging');
         try {
           session = await deriveSession(userId, partnerId, myPublicKey, partnerPublicKey);
@@ -702,14 +735,16 @@ export function createPairing({ keyStore, transport } = {}) {
 
       transport.on('pair_reveal', async (payload) => {
         if (settled || !payload || role !== 'joiner') return;
+        if (!lockOrVerifyPartner(payload.userId)) return;
         // The joiner only ever sends pair_response after its own admission
         // resolved to 'admitted' (see the pair_commit handler above), so an
         // honest reveal cannot arrive before that — this guard exists for a
         // reveal that arrives while admission is still pending/refused
         // anyway (e.g. a forged/duplicated message), so it never gets
         // processed before this side has decided to pair with the partner.
+        // It runs after the identity lock, as the base ordering did, and is
+        // a no-op without an admitPartner (admission is 'admitted').
         if (admission !== 'admitted') return;
-        if (!lockOrVerifyPartner(payload.userId)) return;
         if (partnerCommit === null) return; // reveal before commit — ignore
         if (partnerPublicKey !== null) {
           if (payload.publicKey !== partnerPublicKey) fail(CONTESTED_ERROR, CONTESTED_CODE);
@@ -775,9 +810,10 @@ export function createPairing({ keyStore, transport } = {}) {
         // once it has received and verified one). This guard exists for a
         // confirm that arrives before that — e.g. a forged/duplicated
         // message while admission is still pending/refused — so it is never
-        // processed early.
-        if (admission !== 'admitted') return;
+        // processed early. After the identity lock, as in the base ordering;
+        // a no-op without an admitPartner.
         if (!lockOrVerifyPartner(payload.userId)) return;
+        if (admission !== 'admitted') return;
         const senderRole = role === 'initiator' ? 'joiner' : 'initiator';
         const ok = await verifyConfirm(payload, senderRole);
         if (settled) return;
@@ -826,21 +862,27 @@ export function createPairing({ keyStore, transport } = {}) {
       // able to lock or contest the handshake by itself) and never copies
       // `payload.reason` into the thrown error (it is untrusted, unauthenticated
       // free text from the wire). Works while this side's OWN admission is
-      // still pending — nothing here depends on `admission`.
-      transport.on('pair_abort', (payload) => {
-        if (settled || !payload) return;
-        const fromId = payload.userId;
-        if (typeof fromId !== 'string' || !UUID_RE.test(fromId) || fromId === userId) return;
-        if (role === 'initiator') {
-          if (partnerPublicKey === null || fromId === partnerId) {
+      // still pending — nothing here depends on `admission`. Registered only
+      // when this side was given an admitPartner: without one the handshake
+      // listens for exactly the four events it always did, and a peer's
+      // refusal reaches it the way it reaches an old peer — as its own
+      // timeout, with nothing stored.
+      if (hasAdmission) {
+        transport.on('pair_abort', (payload) => {
+          if (settled || !payload) return;
+          const fromId = payload.userId;
+          if (typeof fromId !== 'string' || !UUID_RE.test(fromId) || fromId === userId) return;
+          if (role === 'initiator') {
+            if (partnerPublicKey === null || fromId === partnerId) {
+              fail(PEER_REFUSED_ERROR, PEER_REFUSED_CODE);
+            }
+            return;
+          }
+          if (partnerPublicKey === null && fromId === partnerId) {
             fail(PEER_REFUSED_ERROR, PEER_REFUSED_CODE);
           }
-          return;
-        }
-        if (partnerPublicKey === null && fromId === partnerId) {
-          fail(PEER_REFUSED_ERROR, PEER_REFUSED_CODE);
-        }
-      });
+        });
+      }
 
       // A Transport that can detect fatal connection loss surfaces it through
       // the optional onError seam — the handshake then fails immediately

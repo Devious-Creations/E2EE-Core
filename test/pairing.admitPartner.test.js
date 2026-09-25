@@ -47,13 +47,18 @@ function createSpyTransportPair() {
   const [a, b] = createMemoryTransportPair();
   const wrap = (endpoint) => {
     const sentEvents = [];
+    const listening = new Set();
     return {
       sentEvents,
+      listening,
       send(event, payload) {
         sentEvents.push({ event, payload });
         return endpoint.send(event, payload);
       },
-      on: endpoint.on.bind(endpoint),
+      on(event, handler) {
+        listening.add(event);
+        endpoint.on(event, handler);
+      },
       close: endpoint.close.bind(endpoint),
     };
   };
@@ -65,13 +70,17 @@ function createSpyTransportPair() {
 // directly — the same technique pairing.test.js's createRawTransport uses for
 // its contested-path tests. Used wherever a test needs fine control over
 // exactly when a message arrives, e.g. to hold a handshake mid-admission.
-function createRawTransport() {
+// `sendImpl`, if given, supplies send()'s return value (e.g. a promise that
+// holds a `pair_abort` flush open until the test releases it).
+function createRawTransport({ sendImpl } = {}) {
   const handlers = new Map();
   const sent = [];
   return {
     sent,
+    events: () => [...handlers.keys()].sort(),
     send(event, payload) {
       sent.push({ event, payload });
+      return sendImpl ? sendImpl(event, payload) : undefined;
     },
     on(event, handler) {
       if (!handlers.has(event)) handlers.set(event, new Set());
@@ -144,6 +153,85 @@ function makeOldPeerTransport(endpoint) {
   };
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+// Records whether a handshake promise has settled, without consuming its
+// rejection (the caller still asserts on the promise itself).
+function track(promise) {
+  const state = { settled: false };
+  promise.then(
+    () => {
+      state.settled = true;
+    },
+    () => {
+      state.settled = true;
+    },
+  );
+  return state;
+}
+
+// A REAL setImmediate round-trip drains the whole pending microtask queue
+// between event-loop turns (mock.timers only fakes setTimeout/setInterval).
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+// Turn the event loop until `predicate()` holds; fail (never hang) after a
+// bounded number of turns.
+async function runUntil(predicate, what, maxTurns = 500) {
+  for (let i = 0; i < maxTurns; i++) {
+    if (predicate()) return;
+    await flush();
+  }
+  assert.fail(`timed out waiting for: ${what}`);
+}
+
+// The four handshake events a side without admitPartner has always listened
+// for — `pair_abort` is only added when admitPartner is supplied.
+const BASE_EVENTS = ['pair_commit', 'pair_confirm', 'pair_response', 'pair_reveal'];
+
+// The commitment a QR-path joiner scanned; its wire pair_commit carries it.
+const QR_COMMIT = await random32Base64();
+
+// Each side under test: how to start it, the message that locks its partner
+// (and triggers its admission call), and the message it must never send
+// before it has admitted that partner. The QR-path joiner has an extra await
+// between its "is a commit already recorded?" check and recording one, which
+// is where same-tick duplicates used to slip through.
+const ROLES = [
+  {
+    role: 'initiator',
+    start: (P, code, options) => P.initiatePairing(code, UUID_A, () => {}, options),
+    partner: UUID_B,
+    lockEvent: 'pair_response',
+    lockPayload: async () => ({ userId: UUID_B, publicKey: await random32Base64() }),
+    gated: 'pair_reveal',
+  },
+  {
+    role: 'joiner',
+    start: (P, code, options) => P.joinPairing(code, UUID_B, () => {}, options),
+    partner: UUID_A,
+    lockEvent: 'pair_commit',
+    lockPayload: async () => ({ userId: UUID_A, commit: await random32Base64() }),
+    gated: 'pair_response',
+  },
+  {
+    role: 'joiner, QR path',
+    start: (P, code, options) =>
+      P.joinPairing(code, UUID_B, () => {}, { expectedCommit: QR_COMMIT, ...options }),
+    partner: UUID_A,
+    lockEvent: 'pair_commit',
+    lockPayload: async () => ({ userId: UUID_A, commit: QR_COMMIT }),
+    gated: 'pair_response',
+  },
+];
+
 test('admission: no admitPartner supplied → behaves exactly as before (no admission gate)', async () => {
   const [tA, tB] = createMemoryTransportPair();
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
@@ -183,7 +271,8 @@ test('admission: initiator refuses → initiator rejects PARTNER_NOT_ADMITTED, j
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
   const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
 
-  const joinP = B.joinPairing('WOLF-AD03', UUID_B, () => {});
+  // The joiner listens for pair_abort only because it runs admission itself.
+  const joinP = B.joinPairing('WOLF-AD03', UUID_B, () => {}, { admitPartner: async () => true });
   await new Promise((r) => setTimeout(r, 0));
   const initP = A.initiatePairing('WOLF-AD03', UUID_A, () => {}, {
     admitPartner: async () => false,
@@ -216,7 +305,7 @@ test('admission: joiner refuses → joiner rejects PARTNER_NOT_ADMITTED; the (un
     admitPartner: async () => false,
   });
   await new Promise((r) => setTimeout(r, 0));
-  const initP = A.initiatePairing('WOLF-AD04', UUID_A, () => {});
+  const initP = A.initiatePairing('WOLF-AD04', UUID_A, () => {}, { admitPartner: async () => true });
 
   await Promise.all([
     assert.rejects(
@@ -278,7 +367,7 @@ for (const [label, result] of [
     const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
     const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
 
-    const joinP = B.joinPairing('WOLF-AD06', UUID_B, () => {});
+    const joinP = B.joinPairing('WOLF-AD06', UUID_B, () => {}, { admitPartner: async () => true });
     await new Promise((r) => setTimeout(r, 0));
     const initP = A.initiatePairing('WOLF-AD06', UUID_A, () => {}, {
       admitPartner: async () => result,
@@ -294,7 +383,7 @@ test('admission: admitPartner throwing synchronously refuses (fail closed)', asy
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
   const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
 
-  const joinP = B.joinPairing('WOLF-AD07', UUID_B, () => {});
+  const joinP = B.joinPairing('WOLF-AD07', UUID_B, () => {}, { admitPartner: async () => true });
   await new Promise((r) => setTimeout(r, 0));
   const initP = A.initiatePairing('WOLF-AD07', UUID_A, () => {}, {
     admitPartner: () => {
@@ -311,7 +400,7 @@ test('admission: admitPartner rejecting refuses (fail closed)', async () => {
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
   const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
 
-  const joinP = B.joinPairing('WOLF-AD08', UUID_B, () => {});
+  const joinP = B.joinPairing('WOLF-AD08', UUID_B, () => {}, { admitPartner: async () => true });
   await new Promise((r) => setTimeout(r, 0));
   const initP = A.initiatePairing('WOLF-AD08', UUID_A, () => {}, {
     admitPartner: async () => {
@@ -439,22 +528,47 @@ test('admission: a duplicate pair_commit with a DIFFERENT value while admission 
   await rejection;
 });
 
-test('pair_abort: a non-partner id on the joiner is ignored — the handshake still completes', async () => {
-  const [tA, tB] = createMemoryTransportPair();
-  const tBw = wrapWithEmit(tB);
-  const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
-  const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tBw });
+// The joiner's abort window: partner locked, pair_response going out, reveal
+// not yet accepted. Injecting from inside the joiner's FIRST pair_response
+// send lands exactly in that window (the whole handshake settles in a few ms,
+// so a timer-based injection would only prove luck).
+for (const [label, fromId, refused] of [
+  ['a non-partner id is ignored', UUID_C, false],
+  ["the joiner's OWN id is ignored", UUID_B, false],
+  ['the locked partner fails PEER_REFUSED', UUID_A, true],
+]) {
+  test(`pair_abort (joiner, inside the reveal window): ${label}`, async () => {
+    const [tA, tB] = createMemoryTransportPair();
+    let injected = false;
+    let tBw;
+    tBw = wrapWithEmit(tB, {
+      onSend: (event) => {
+        if (event === 'pair_response' && !injected) {
+          injected = true;
+          tBw.emit('pair_abort', { userId: fromId, reason: 'not_admitted' });
+        }
+      },
+    });
+    const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
+    const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tBw });
 
-  const joinP = B.joinPairing('WOLF-AD13', UUID_B, () => {});
-  await new Promise((r) => setTimeout(r, 0));
-  const initP = A.initiatePairing('WOLF-AD13', UUID_A, () => {});
+    const joinP = B.joinPairing('WOLF-AD13', UUID_B, () => {}, { admitPartner: async () => true });
+    await sleep(0);
+    const initP = A.initiatePairing('WOLF-AD13', UUID_A, () => {});
 
-  await new Promise((r) => setTimeout(r, 10));
-  tBw.emit('pair_abort', { userId: UUID_C, reason: 'not_admitted' });
-
-  const [rB, rA] = await Promise.all([joinP, initP]);
-  assert.equal(rA.sharedKey, rB.sharedKey, 'a bogus abort from a non-partner id must not affect the handshake');
-});
+    if (refused) {
+      await assert.rejects(() => joinP, (err) => err.code === PEER_REFUSED_CODE);
+      // The memory transport pair shares one open flag, so the initiator hears
+      // nothing more once the joiner closed — end it by hand.
+      A.cancelActiveHandshake();
+      await assert.rejects(() => initP, /Pairing cancelled/);
+    } else {
+      const [rB, rA] = await Promise.all([joinP, initP]);
+      assert.equal(rA.sharedKey, rB.sharedKey, 'the abort must not affect the handshake');
+    }
+    assert.ok(injected, 'the abort was actually injected inside the window');
+  });
+}
 
 test('pair_abort: an abort delivered after the reveal window closes is ignored (joiner side) — the handshake still completes', async () => {
   const [tA, tB] = createMemoryTransportPair();
@@ -475,7 +589,8 @@ test('pair_abort: an abort delivered after the reveal window closes is ignored (
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport: tA });
   const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tBw });
 
-  const joinP = B.joinPairing('WOLF-AD14', UUID_B, () => {});
+  // admitPartner on the joiner, so it has a pair_abort listener to test.
+  const joinP = B.joinPairing('WOLF-AD14', UUID_B, () => {}, { admitPartner: async () => true });
   await new Promise((r) => setTimeout(r, 0));
   const initP = A.initiatePairing('WOLF-AD14', UUID_A, () => {});
 
@@ -566,10 +681,21 @@ test('old peer: a side whose transport drops pair_abort (no listener) rejects vi
 
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   try {
-    const [tA, tB] = createMemoryTransportPair();
-    const oldA = makeOldPeerTransport(tA); // simulates a peer that predates pair_abort entirely
+    const [sA, sB] = createSpyTransportPair();
+    const oldA = makeOldPeerTransport(sA); // simulates a peer that predates pair_abort entirely
     const A = createPairing({ keyStore: createMemoryKeyStore(), transport: oldA });
-    const B = createPairing({ keyStore: createMemoryKeyStore(), transport: tB });
+    const B = createPairing({ keyStore: createMemoryKeyStore(), transport: sB });
+
+    // B subscribes first: with setInterval mocked, A's pair_commit goes out
+    // once and never repeats, so a B that isn't listening yet would never
+    // see it (and never refuse).
+    let joinErr = null;
+    const joinDone = B.joinPairing('WOLF-AD17', UUID_B, () => {}, {
+      admitPartner: async () => false,
+    }).catch((err) => {
+      joinErr = err;
+    });
+    await runUntil(() => sB.listening.has('pair_commit'), 'B to subscribe');
 
     let resolved = false;
     let rejectedErr = null;
@@ -581,38 +707,82 @@ test('old peer: a side whose transport drops pair_abort (no listener) rejects vi
         rejectedErr = err;
       },
     );
-    const joinDone = B.joinPairing('WOLF-AD17', UUID_B, () => {}, {
-      admitPartner: async () => false,
-    }).catch(() => {});
 
-    // Let the handshake run its microtask-driven exchange far enough for B to
-    // receive A's commit, refuse, and (best-effort) send a pair_abort that
-    // A's transport silently drops — all of this happens without any real
-    // timer firing. A REAL setImmediate round-trip (not `mock.timers`, which
-    // only fakes setTimeout/setInterval) drains the ENTIRE pending microtask
-    // queue between event-loop turns, however many awaits deep the two
-    // concurrent handshakes' setup chains are — a fixed count of bare
-    // `await Promise.resolve()` calls only pops one level per call and can
-    // undercount that depth.
-    const flush = () => new Promise((resolve) => setImmediate(resolve));
-    for (let i = 0; i < 5; i++) {
-      await flush();
-    }
+    // A registers its handshake timeout in the same synchronous step that
+    // sends its first pair_commit, so "A sent pair_commit" proves the timer
+    // exists before we tick it. B must have refused and flushed its abort.
+    await runUntil(
+      () => sA.sentEvents.some((m) => m.event === 'pair_commit') && joinErr !== null,
+      'A to send pair_commit and B to refuse',
+    );
+    assert.equal(joinErr.code, PARTNER_NOT_ADMITTED_CODE, 'B refused');
+    assert.ok(sB.sentEvents.some((m) => m.event === 'pair_abort'), 'B sent pair_abort before the tick');
     assert.equal(resolved, false, 'A must not resolve while its own transport drops the abort');
     assert.equal(rejectedErr, null, 'A must not have rejected yet either — it is still waiting');
 
     // Advance past the full handshake timeout — A's own no-store guarantee
     // (reject on timeout) must never depend on the abort arriving.
     t.mock.timers.tick(PAIRING_TIMEOUT_MS);
-    for (let i = 0; i < 5; i++) {
-      await flush();
-    }
+    await runUntil(() => rejectedErr !== null || resolved, 'A to settle after its timeout');
     await initDone;
     await joinDone;
 
-    assert.ok(rejectedErr, 'A must eventually reject');
     assert.match(rejectedErr.message, /Pairing timed out/);
     assert.equal(resolved, false, 'A must never resolve — the library never stores mid-handshake either way');
+  } finally {
+    t.mock.timers.reset();
+  }
+});
+
+test('old peer: an old JOINER meeting a refusing initiator never gets pair_reveal and rejects via its own timeout', async (t) => {
+  const warmKeypair = await primitives.generateKeypair();
+  await primitives.encodeBase64(warmKeypair.publicKey);
+  await primitives.sha256Bytes(warmKeypair.publicKey);
+
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  try {
+    const [sA, sB] = createSpyTransportPair();
+    const A = createPairing({ keyStore: createMemoryKeyStore(), transport: sA });
+    const oldB = makeOldPeerTransport(sB);
+    const B = createPairing({ keyStore: createMemoryKeyStore(), transport: oldB });
+
+    let joinResolved = false;
+    let joinErr = null;
+    const joinDone = B.joinPairing('WOLF-AD20', UUID_B, () => {}).then(
+      () => {
+        joinResolved = true;
+      },
+      (err) => {
+        joinErr = err;
+      },
+    );
+    await runUntil(() => sB.listening.has('pair_commit'), 'B to subscribe');
+
+    let initErr = null;
+    const initDone = A.initiatePairing('WOLF-AD20', UUID_A, () => {}, {
+      admitPartner: async () => false,
+    }).catch((err) => {
+      initErr = err;
+    });
+
+    // B's timeout is registered before it can ever send pair_response.
+    await runUntil(
+      () => sB.sentEvents.some((m) => m.event === 'pair_response') && initErr !== null,
+      'B to respond and A to refuse',
+    );
+    assert.equal(initErr.code, PARTNER_NOT_ADMITTED_CODE, 'A refused');
+    assert.ok(sA.sentEvents.some((m) => m.event === 'pair_abort'), 'A sent pair_abort');
+    assert.ok(!sA.sentEvents.some((m) => m.event === 'pair_reveal'), 'A never revealed');
+    assert.equal(joinResolved, false);
+    assert.equal(joinErr, null, 'B is still waiting');
+
+    t.mock.timers.tick(PAIRING_TIMEOUT_MS);
+    await runUntil(() => joinErr !== null || joinResolved, 'B to settle after its timeout');
+    await joinDone;
+    await initDone;
+
+    assert.match(joinErr.message, /Pairing timed out/);
+    assert.equal(joinResolved, false, 'B must never resolve');
   } finally {
     t.mock.timers.reset();
   }
@@ -647,4 +817,185 @@ test('exported constants: PARTNER_NOT_ADMITTED_* / PEER_REFUSED_* are reachable 
   assert.equal(pairingNamespace.PARTNER_NOT_ADMITTED_CODE, PARTNER_NOT_ADMITTED_CODE);
   assert.equal(pairingNamespace.PEER_REFUSED_ERROR, PEER_REFUSED_ERROR);
   assert.equal(pairingNamespace.PEER_REFUSED_CODE, PEER_REFUSED_CODE);
+});
+
+test('option absent: only the four base events are listened for; admitPartner adds pair_abort', async () => {
+  for (const r of ROLES) {
+    const plain = createRawTransport();
+    const P = createPairing({ keyStore: createMemoryKeyStore(), transport: plain });
+    const attempt = r.start(P, 'WOLF-AD21', undefined);
+    await sleep(20);
+    assert.deepEqual(plain.events(), BASE_EVENTS, `${r.role} without admitPartner`);
+    P.cancelActiveHandshake();
+    await assert.rejects(() => attempt, /Pairing cancelled/);
+
+    const gatedT = createRawTransport();
+    const Q = createPairing({ keyStore: createMemoryKeyStore(), transport: gatedT });
+    const attempt2 = r.start(Q, 'WOLF-AD21', { admitPartner: async () => true });
+    await sleep(20);
+    assert.deepEqual(gatedT.events(), [...BASE_EVENTS, 'pair_abort'].sort(), `${r.role} with admitPartner`);
+    Q.cancelActiveHandshake();
+    await assert.rejects(() => attempt2, /Pairing cancelled/);
+  }
+});
+
+for (const r of ROLES) {
+  test(`same tick: two ${r.lockEvent}s delivered together call admitPartner once (${r.role})`, async () => {
+    const transport = createRawTransport();
+    let calls = 0;
+    let resolveAdmit;
+    const P = createPairing({ keyStore: createMemoryKeyStore(), transport });
+    const attempt = r.start(P, 'WOLF-AD22', {
+      admitPartner: () => {
+        calls += 1;
+        return new Promise((resolve) => {
+          resolveAdmit = resolve;
+        });
+      },
+    });
+
+    await sleep(20);
+    const payload = await r.lockPayload();
+    transport.emit(r.lockEvent, payload);
+    transport.emit(r.lockEvent, payload);
+    await sleep(20);
+    assert.equal(calls, 1, 'admitPartner is asked exactly once');
+
+    resolveAdmit(true);
+    await sleep(20);
+    assert.equal(
+      transport.sent.filter((m) => m.event === r.gated).length,
+      1,
+      `${r.gated} goes out once admitted, exactly once`,
+    );
+
+    P.cancelActiveHandshake();
+    await assert.rejects(() => attempt, /Pairing cancelled/);
+  });
+
+  test(`same tick: a refusal cannot be overtaken by a second admission while the abort is still flushing (${r.role})`, async () => {
+    const abortFlush = deferred();
+    const transport = createRawTransport({
+      sendImpl: (event) => (event === 'pair_abort' ? abortFlush.promise : undefined),
+    });
+    const answers = [false, true];
+    let calls = 0;
+    const P = createPairing({ keyStore: createMemoryKeyStore(), transport });
+    const attempt = r.start(P, 'WOLF-AD24', { admitPartner: async () => answers[calls++] });
+    const state = track(attempt);
+
+    await sleep(20);
+    const payload = await r.lockPayload();
+    transport.emit(r.lockEvent, payload);
+    transport.emit(r.lockEvent, payload);
+    await sleep(20);
+    assert.equal(calls, 1, 'admitPartner is asked exactly once — the refusal stands');
+    assert.ok(!transport.sent.some((m) => m.event === r.gated), `${r.gated} is never sent`);
+    assert.equal(state.settled, false, 'still flushing the abort');
+
+    abortFlush.resolve();
+    await assert.rejects(() => attempt, (err) => err.code === PARTNER_NOT_ADMITTED_CODE);
+    assert.ok(!transport.sent.some((m) => m.event === r.gated), `${r.gated} is never sent`);
+    assert.equal(transport.sent.filter((m) => m.event === 'pair_abort').length, 1, 'one pair_abort');
+  });
+
+  test(`admission pending: an early reveal/confirm is dropped (${r.role})`, async () => {
+    const transport = createRawTransport();
+    const P = createPairing({ keyStore: createMemoryKeyStore(), transport });
+    const attempt = r.start(P, 'WOLF-AD28', { admitPartner: () => new Promise(() => {}) });
+    const state = track(attempt);
+
+    await sleep(20);
+    transport.emit(r.lockEvent, await r.lockPayload());
+    await sleep(20);
+    const sentBefore = transport.sent.length;
+    transport.emit('pair_reveal', { userId: r.partner, publicKey: await random32Base64() });
+    transport.emit('pair_confirm', { userId: r.partner, mac: await random32Base64() });
+    await sleep(20);
+    // Processed, either message would fail TAMPERED (no session, no matching commit).
+    assert.equal(state.settled, false, 'the early reveal/confirm were dropped, not processed');
+    assert.deepEqual(transport.sent.slice(sentBefore), [], 'nothing is sent in reply');
+
+    P.cancelActiveHandshake();
+    await assert.rejects(() => attempt, /Pairing cancelled/);
+  });
+
+  test(`admission refused: while the abort flushes, duplicates, reveal and confirm are dropped and nothing more is sent (${r.role})`, async () => {
+    const abortFlush = deferred();
+    const transport = createRawTransport({
+      sendImpl: (event) => (event === 'pair_abort' ? abortFlush.promise : undefined),
+    });
+    const P = createPairing({ keyStore: createMemoryKeyStore(), transport });
+    const attempt = r.start(P, 'WOLF-AD29', { admitPartner: async () => false });
+    const state = track(attempt);
+
+    await sleep(20);
+    const payload = await r.lockPayload();
+    transport.emit(r.lockEvent, payload);
+    await sleep(20);
+    assert.ok(transport.sent.some((m) => m.event === 'pair_abort'), 'refused and flushing the abort');
+    const sentBefore = transport.sent.length;
+
+    transport.emit(r.lockEvent, payload); // the refused partner's message, repeated
+    transport.emit('pair_reveal', { userId: r.partner, publicKey: await random32Base64() });
+    transport.emit('pair_confirm', { userId: r.partner, mac: await random32Base64() });
+    await sleep(20);
+    assert.equal(state.settled, false, 'still flushing the abort');
+    assert.deepEqual(transport.sent.slice(sentBefore), [], 'nothing more is sent after a refusal');
+
+    abortFlush.resolve();
+    await assert.rejects(() => attempt, (err) => err.code === PARTNER_NOT_ADMITTED_CODE);
+    assert.ok(!transport.sent.some((m) => m.event === r.gated), `${r.gated} is never sent`);
+  });
+}
+
+test('pair_abort (initiator, before any response is accepted): its own id is ignored, any third-party id fails PEER_REFUSED', async () => {
+  const transport = createRawTransport();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
+  const attempt = A.initiatePairing('WOLF-AD25', UUID_A, () => {}, { admitPartner: async () => true });
+  const state = track(attempt);
+
+  await sleep(20);
+  transport.emit('pair_abort', { userId: UUID_A, reason: 'not_admitted' });
+  await sleep(20);
+  assert.equal(state.settled, false, 'an abort carrying its own id is ignored');
+
+  transport.emit('pair_abort', { userId: UUID_C, reason: 'not_admitted' });
+  await assert.rejects(() => attempt, (err) => err.code === PEER_REFUSED_CODE);
+});
+
+test('pair_abort (initiator, after the partner is locked): a non-partner id is ignored, the locked partner fails PEER_REFUSED', async () => {
+  const transport = createRawTransport();
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
+  const attempt = A.initiatePairing('WOLF-AD26', UUID_A, () => {}, { admitPartner: async () => true });
+  const state = track(attempt);
+
+  await sleep(20);
+  transport.emit('pair_response', { userId: UUID_B, publicKey: await random32Base64() });
+  await sleep(20);
+  assert.ok(transport.sent.some((m) => m.event === 'pair_reveal'), 'admitted and revealed: the partner is locked');
+
+  transport.emit('pair_abort', { userId: UUID_C, reason: 'not_admitted' });
+  transport.emit('pair_abort', { userId: UUID_A, reason: 'not_admitted' });
+  await sleep(20);
+  assert.equal(state.settled, false, 'aborts from a non-partner id or its own id are ignored');
+
+  transport.emit('pair_abort', { userId: UUID_B, reason: 'not_admitted' });
+  await assert.rejects(() => attempt, (err) => err.code === PEER_REFUSED_CODE);
+});
+
+test('refusal: a pair_abort send that never resolves still fails PARTNER_NOT_ADMITTED after one repeat interval', async () => {
+  const transport = createRawTransport({
+    sendImpl: (event) => (event === 'pair_abort' ? new Promise(() => {}) : undefined),
+  });
+  const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
+  const attempt = A.initiatePairing('WOLF-AD27', UUID_A, () => {}, { admitPartner: async () => false });
+
+  await sleep(20);
+  const start = Date.now();
+  transport.emit('pair_response', { userId: UUID_B, publicKey: await random32Base64() });
+  await assert.rejects(() => attempt, (err) => err.code === PARTNER_NOT_ADMITTED_CODE);
+  const elapsedMs = Date.now() - start;
+  assert.ok(elapsedMs >= 1500, `it waited for the bounded flush window (${elapsedMs}ms)`);
+  assert.ok(elapsedMs < 5000, `bounded by one repeat interval, not the handshake timeout (${elapsedMs}ms)`);
 });
