@@ -3,8 +3,9 @@
 > (whole doc re-read against `src/pairing.js` as changed by this commit —
 > every `src/pairing.js:NNN` anchor in every section re-checked, including the
 > ones the previous pass carried over unverified; the "Partner admission"
-> section updated for the same-tick duplicate fix and the option-absent path;
-> the contested-trigger list completed)
+> section updated for the same-tick duplicate fix, the option-absent path and
+> the initiator's narrowed `pair_abort` window; the contested-trigger list
+> completed)
 >
 > **Prior stamp:** `f30d8b1` · 2026-09-24 · by coder (added "Partner
 > admission"; only that section's anchors were checked)
@@ -198,13 +199,17 @@ out:
   didn't make. The joiner's fires at the start of the handshake exactly as
   before (`src/pairing.js:368-370`).
 
-**Without `admitPartner`, nothing changes.** The per-side state
-(`src/pairing.js:433`) then starts, and stays, `'admitted'`, so every
-admission gate below is a no-op; neither call site awaits anything extra;
-and no `pair_abort` listener is registered — the handshake listens for the
-same four events and takes the same steps it always did. (A refusing peer's
-abort therefore reaches such a side exactly as it reaches an old peer: as its
-own timeout, with nothing stored — see "Old/new peer interop".)
+**Without `admitPartner`, the handshake is unchanged, except for two
+hardenings that apply to every handshake** (both below): a same-tick
+duplicate of a locking message can no longer be processed twice or overwrite
+the recorded key/commit, and a repeat loop that settles on its first send no
+longer leaks its interval (see Traps). Otherwise the per-side state
+(`src/pairing.js:433`) starts, and stays, `'admitted'`, so every admission
+gate below is a no-op; neither call site awaits anything extra; and no
+`pair_abort` listener is registered — the handshake listens for the same four
+events and takes the same steps it always did. (A refusing peer's abort
+therefore reaches such a side exactly as it reaches an old peer: as its own
+timeout, with nothing stored — see "Old/new peer interop".)
 
 **With it, a per-handshake, per-side state machine:** `admission: 'none' |
 'pending' | 'admitted' | 'refused'`. `'none'` until the partner's identity is
@@ -280,14 +285,17 @@ key material exists to sign or verify it with:
 - **Initiator:** before any `pair_response` has been accepted, *any* valid,
   well-formed UUID that isn't its own id is honoured — no lock needed, the
   same way an unlocked initiator already fails closed on a foreign
-  `pair_commit` today. Once a response has been accepted (a partner is
-  locked), only that locked partner's id is honoured, and only up to the
-  point the handshake settles.
+  `pair_commit` today. Once a response has been accepted, **nothing** is
+  honoured — not even the locked partner's id. A joiner only refuses before
+  it sends `pair_response`, so no honest abort can follow an accepted
+  response; honouring a forged one (e.g. while the initiator flushes its
+  final `pair_confirm`, after a QR-path joiner may already have resolved)
+  could only produce a one-sided pairing.
 - **Joiner:** only from the locked initiator's id (`partnerId` — `null`
   until `pair_commit` locks it, so nothing can match before that), and only
   before a `pair_reveal` has been accepted.
 - Outside those windows the message is silently dropped. The handler
-  (`src/pairing.js:870-885`) never calls `lockOrVerifyPartner` (an abort must
+  (`src/pairing.js:871-884`) never calls `lockOrVerifyPartner` (an abort must
   not be able to lock or contest the handshake by itself) and never copies
   `payload.reason` into the thrown error (it is untrusted free text). It also
   works while *this* side's own admission is still pending or unresolved —
@@ -370,7 +378,7 @@ promise. Every event handler in `performHandshake` checks `settled` at its
 top or via `lockOrVerifyPartner`'s own guard, so a message arriving after
 `fail()` — even a well-formed, correctly-signed one from the *original*
 locked partner — is silently dropped, not processed
-(`src/pairing.js:606-885`, the `if (settled ...) return;` guards on every
+(`src/pairing.js:606-884`, the `if (settled ...) return;` guards on every
 handler). **There is no path back to `pending`/`exchanging` once `settled` is
 true.** `test/pairing.test.js:421-451` pins exactly this: it crafts a
 post-abort message from the originally-locked partner and asserts no further
@@ -443,7 +451,7 @@ Pairing state persists through the injected `KeyStore`
 `{ id, partnerId, channelName, dynamicId?, nickname? }`), `pairing_key_<id>`
 (base64 `K_pair` per pairing), `relay_active_partner`, and three legacy
 single-partner slots migrated once on first read
-(`migrateLegacyPairing`, `src/pairing.js:929-957`). **Trust is committed at
+(`migrateLegacyPairing`, `src/pairing.js:928-956`). **Trust is committed at
 `storePairing`, not at handshake success** — `performHandshake` resolving
 only means keys are exchanged and confirmed; the caller must still show the
 SAS for explicit human comparison and only then call `storePairing`
@@ -452,7 +460,7 @@ SAS for explicit human comparison and only then call `storePairing`
 **Every `relay_pairings` read-modify-write runs under one lock, keyed by the
 `KeyStore` object, not by controller.** Five mutators —
 `storePairing`, `setPairingDynamicId`, `updatePairingNickname`,
-`removePairing`, and `clearPairing` (`src/pairing.js:1038-1159`) — each read
+`removePairing`, and `clearPairing` (`src/pairing.js:1037-1158`) — each read
 the JSON array → mutate it in memory → write it back; without coordination,
 two of those calls running concurrently against the same store (e.g. a
 background dynamic-id resolve racing a user-triggered nickname rename) can
@@ -460,9 +468,9 @@ interleave their read and write so one call's change is silently overwritten
 by the other's stale copy of the array. `migrateLegacyPairing` is a sixth
 writer of `relay_pairings`, but it only ever runs *under* the lock — either
 directly, wrapped in `withPairingsLock` from the public `getStoredPairings`
-when a legacy key is still present (`src/pairing.js:987-992`), or as part of
+when a legacy key is still present (`src/pairing.js:986-991`), or as part of
 `readPairingsUnlocked` when called from inside an already-locked mutator's
-critical section (`src/pairing.js:959-978`) — never on its own outside one.
+critical section (`src/pairing.js:958-977`) — never on its own outside one.
 
 Consumers commonly build a **fresh controller per call** over one shared,
 long-lived `KeyStore` (the app's own pairing wrapper does exactly this), so a
@@ -473,7 +481,7 @@ lock is instead a module-level `WeakMap<KeyStore, Lock>`
 promise-chain mutex in `./asyncLock.js`, the same shape `ratchet.js`'s own
 `withLock` already uses): every `createPairing({ keyStore })` call looks up
 (or creates) the one lock for that `keyStore` object
-(`src/pairing.js:927`), so any number of controllers built over the same
+(`src/pairing.js:926`), so any number of controllers built over the same
 store share the same lock and queue behind each other instead of
 interleaving. Two separate stores never share a lock, and don't need to.
 
@@ -481,10 +489,10 @@ interleaving. Two separate stores never share a lock, and don't need to.
 single `relay_pairings` blob regardless of which pairing they touch, so
 keying the lock by pairing id would not have closed the race (two calls
 touching *different* ids still clobber the one shared array).
-`readPairingsUnlocked` (`src/pairing.js:959-978`) is the internal, unlocked
+`readPairingsUnlocked` (`src/pairing.js:958-977`) is the internal, unlocked
 read+migrate step — it must only ever be called from inside a function that
 already holds the lock (taking it again there would deadlock against
-itself); the public `getStoredPairings` (`src/pairing.js:980-992`) is safe to
+itself); the public `getStoredPairings` (`src/pairing.js:979-991`) is safe to
 call from anywhere, since it takes the lock itself for the migration and
 reads unlocked afterward. `relay_active_partner` is not covered by this lock
 (no interleave against it was found to break it) — each mutator that touches
@@ -499,7 +507,7 @@ the same underlying storage are not serialized by it.
 ## Traps
 
 **Re-pairing an existing partner overwrites `pairing_key_<id>` in place**
-(`src/pairing.js:1060-1070`) — the pairing id is preserved, only the key and
+(`src/pairing.js:1059-1069`) — the pairing id is preserved, only the key and
 channel name rotate. This module does **not** clear ratchet state or an
 offline message queue for the old root when that happens; see "deliberately
 dropped app coupling" below.
@@ -544,13 +552,13 @@ not the handshake itself:
 
 - On re-pair rotation, the app purges the offline message queue and ratchet
   chain state under both the old and new channel name so queued ciphertext
-  under an abandoned root cannot be silently dropped (`src/pairing.js:1042-1047,
-  1062-1064`). **A consumer here must do this itself.**
+  under an abandoned root cannot be silently dropped (`src/pairing.js:1041-1046,
+  1061-1063`). **A consumer here must do this itself.**
 - The app best-effort registers/unregisters the pairing server-side for
-  premium propagation (`src/pairing.js:1042-1047, 1113-1115`) — dropped, no
+  premium propagation (`src/pairing.js:1041-1046, 1112-1114`) — dropped, no
   server awareness in this package.
 - `clearPairing` in the app also clears the stored relay keypair, the
-  per-channel last-seen cursor, and ratchet state (`src/pairing.js:1141-1143`)
+  per-channel last-seen cursor, and ratchet state (`src/pairing.js:1140-1142`)
   — none of that lives here.
 
 ## Deliberately not done

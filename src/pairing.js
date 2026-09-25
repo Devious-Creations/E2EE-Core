@@ -271,7 +271,7 @@ export function createPairing({ keyStore, transport } = {}) {
    *   function if present) and, once invoked, can never break or stall the
    *   handshake — see performHandshake for the guard, including the
    *   async-rejection case. `options.admitPartner`, if given, is called
-   *   exactly once, with the locked partner's user id, after the partner's
+   *   at most once, with the locked partner's user id, after the partner's
    *   identity is known but BEFORE this side reveals/responds — resolving to
    *   exactly `true` admits, anything else (including a throw or a rejection)
    *   fails closed and aborts with `PARTNER_NOT_ADMITTED_ERROR` before
@@ -303,7 +303,7 @@ export function createPairing({ keyStore, transport } = {}) {
    *   `QR_COMMITMENT_MISMATCH_ERROR` (`err.code ===
    *   'QR_COMMITMENT_MISMATCH'`) aborts. Omitted: no behavioural change on
    *   the shipped (link/typed-code) path. `options.admitPartner`, if given,
-   *   is called exactly once, with the locked initiator's user id, after the
+   *   is called at most once, with the locked initiator's user id, after the
    *   commitment check above but BEFORE this side's `pair_response` is ever
    *   sent — resolving to exactly `true` admits, anything else (including a
    *   throw or a rejection) fails closed and aborts with
@@ -851,10 +851,11 @@ export function createPairing({ keyStore, transport } = {}) {
       //     valid, foreign UUID is honoured with no lock needed — this
       //     mirrors how an unlocked initiator already fails closed on a
       //     foreign pair_commit (~line above). Once a response has been
-      //     accepted (and hence a partner locked), only that locked partner
-      //     is honoured, and only up to the point this handshake settles
-      //     (pair_confirm completing calls succeed(), which is itself gated
-      //     by `settled` at the top of every handler).
+      //     accepted, NOTHING is honoured: a joiner only ever refuses before
+      //     it sends pair_response, so no honest abort can follow one, and
+      //     honouring a forged one — e.g. while this side flushes its final
+      //     pair_confirm, after a QR-path joiner may already have resolved —
+      //     could leave a one-sided pairing.
       //   - Joiner: only from the locked initiator (partnerId — null until
       //     pair_commit locks it, so an abort arriving before that can never
       //     match), and only before a pair_reveal has been accepted.
@@ -873,9 +874,7 @@ export function createPairing({ keyStore, transport } = {}) {
           const fromId = payload.userId;
           if (typeof fromId !== 'string' || !UUID_RE.test(fromId) || fromId === userId) return;
           if (role === 'initiator') {
-            if (partnerPublicKey === null || fromId === partnerId) {
-              fail(PEER_REFUSED_ERROR, PEER_REFUSED_CODE);
-            }
+            if (partnerPublicKey === null) fail(PEER_REFUSED_ERROR, PEER_REFUSED_CODE);
             return;
           }
           if (partnerPublicKey === null && fromId === partnerId) {

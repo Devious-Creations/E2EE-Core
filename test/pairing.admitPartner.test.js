@@ -902,12 +902,19 @@ for (const r of ROLES) {
   test(`admission pending: an early reveal/confirm is dropped (${r.role})`, async () => {
     const transport = createRawTransport();
     const P = createPairing({ keyStore: createMemoryKeyStore(), transport });
-    const attempt = r.start(P, 'WOLF-AD28', { admitPartner: () => new Promise(() => {}) });
+    let asked = 0;
+    const attempt = r.start(P, 'WOLF-AD28', {
+      admitPartner: () => {
+        asked += 1;
+        return new Promise(() => {});
+      },
+    });
     const state = track(attempt);
 
     await sleep(20);
     transport.emit(r.lockEvent, await r.lockPayload());
     await sleep(20);
+    assert.equal(asked, 1, 'the partner is locked and admission is pending');
     const sentBefore = transport.sent.length;
     transport.emit('pair_reveal', { userId: r.partner, publicKey: await random32Base64() });
     transport.emit('pair_confirm', { userId: r.partner, mac: await random32Base64() });
@@ -956,6 +963,7 @@ test('pair_abort (initiator, before any response is accepted): its own id is ign
   const state = track(attempt);
 
   await sleep(20);
+  assert.ok(transport.events().includes('pair_abort'), 'the abort listener is registered');
   transport.emit('pair_abort', { userId: UUID_A, reason: 'not_admitted' });
   await sleep(20);
   assert.equal(state.settled, false, 'an abort carrying its own id is ignored');
@@ -964,25 +972,54 @@ test('pair_abort (initiator, before any response is accepted): its own id is ign
   await assert.rejects(() => attempt, (err) => err.code === PEER_REFUSED_CODE);
 });
 
-test('pair_abort (initiator, after the partner is locked): a non-partner id is ignored, the locked partner fails PEER_REFUSED', async () => {
+test('pair_abort (initiator, after a response is accepted): every abort is ignored, even one carrying the locked partner id', async () => {
+  // A joiner only refuses before it sends pair_response, so no honest abort
+  // can follow an accepted response — whatever arrives now is forged.
   const transport = createRawTransport();
   const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
   const attempt = A.initiatePairing('WOLF-AD26', UUID_A, () => {}, { admitPartner: async () => true });
   const state = track(attempt);
 
   await sleep(20);
+  assert.ok(transport.events().includes('pair_abort'), 'the abort listener is registered');
   transport.emit('pair_response', { userId: UUID_B, publicKey: await random32Base64() });
   await sleep(20);
-  assert.ok(transport.sent.some((m) => m.event === 'pair_reveal'), 'admitted and revealed: the partner is locked');
+  assert.ok(transport.sent.some((m) => m.event === 'pair_reveal'), 'admitted and revealed: a response was accepted');
 
   transport.emit('pair_abort', { userId: UUID_C, reason: 'not_admitted' });
   transport.emit('pair_abort', { userId: UUID_A, reason: 'not_admitted' });
-  await sleep(20);
-  assert.equal(state.settled, false, 'aborts from a non-partner id or its own id are ignored');
-
   transport.emit('pair_abort', { userId: UUID_B, reason: 'not_admitted' });
-  await assert.rejects(() => attempt, (err) => err.code === PEER_REFUSED_CODE);
+  await sleep(20);
+  assert.equal(state.settled, false, 'no abort is honoured once a response was accepted');
+
+  A.cancelActiveHandshake();
+  await assert.rejects(() => attempt, /Pairing cancelled/);
 });
+
+for (const [label, options] of [
+  ['with admitPartner', { admitPartner: async () => true }],
+  ['without admitPartner', undefined],
+]) {
+  test(`same tick: two pair_responses with DIFFERENT keys fail CONTESTED and never reveal twice (initiator, ${label})`, async () => {
+    const transport = createRawTransport();
+    const A = createPairing({ keyStore: createMemoryKeyStore(), transport });
+    const attempt = A.initiatePairing('WOLF-AD30', UUID_A, () => {}, options);
+    const rejection = assert.rejects(() => attempt, (err) => err.code === CONTESTED_CODE);
+
+    await sleep(20);
+    assert.ok(transport.events().includes('pair_response'), 'the response handler is registered');
+    const [k1, k2] = [await random32Base64(), await random32Base64()];
+    transport.emit('pair_response', { userId: UUID_B, publicKey: k1 });
+    transport.emit('pair_response', { userId: UUID_B, publicKey: k2 });
+
+    await rejection;
+    await sleep(20);
+    assert.ok(
+      transport.sent.filter((m) => m.event === 'pair_reveal').length <= 1,
+      'the second key is never adopted and revealed to',
+    );
+  });
+}
 
 test('refusal: a pair_abort send that never resolves still fails PARTNER_NOT_ADMITTED after one repeat interval', async () => {
   const transport = createRawTransport({
