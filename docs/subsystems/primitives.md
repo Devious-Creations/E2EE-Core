@@ -1,3 +1,7 @@
+> **Scoped note:** branch `chore/1266-dependabot`, base `5d70274` · 2026-10-22 · by claude-work-d2 (ONLY the new
+> "Dependency updates" section at the end, re-read against `.github/dependabot.yml` and `package.json`; nothing else
+> re-read, `Verified against` unchanged)
+>
 > **Verified against:** `91a4ad6` · 2026-09-24 · by coder
 > (re-read `src/primitives.js` in full against this commit — untouched since
 > the prior stamp landed as `8044ba2`; every line anchor checked, no drift)
@@ -109,3 +113,13 @@ complexity for.
   `ratchet.js`/`pairing.js`/`keyVault.js`, never by this module.
 - No caching or memoization of derived keys (KEKs, chain keys) — every
   derivation in this module is a pure, stateless function call.
+
+## Dependency updates
+
+Dependabot (`.github/dependabot.yml`) opens weekly PRs for the GitHub Actions the workflow uses and
+for the npm dependencies. Minor and patch npm bumps are grouped into one PR; a major bump comes on
+its own, so a crypto library's breaking release is read by itself. **Nothing merges automatically:**
+a bump to `tweetnacl`, `tweetnacl-util` or `@noble/hashes` goes through the same PR, green CI and
+review as a code change, and the known-answer tests in `test/` are what catch a behaviour change.
+The app consumes this repo pinned to an exact commit, so a merged bump reaches the app only when
+the app deliberately moves that pin.

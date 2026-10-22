@@ -1,0 +1,22 @@
+# Dependency update PRs. Nothing here merges on its own: every PR still needs green
+# CI and a maintainer's review (see docs/subsystems/primitives.md, "Dependency updates").
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Minor and patch bumps travel together; a major bump of a crypto library gets
+      # its own PR so its changelog is read on its own.
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
