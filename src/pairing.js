@@ -969,11 +969,17 @@ export function createPairing({ keyStore, transport } = {}) {
     await migrateLegacyPairing();
     const raw = await secureGet('relay_pairings');
     if (!raw) return [];
+    let parsed;
     try {
-      return JSON.parse(raw);
+      parsed = JSON.parse(raw);
     } catch {
       return [];
     }
+    // Valid JSON that is not an array (an object, null, a number, a string)
+    // reads as empty too, exactly like unparseable JSON above: every caller
+    // iterates or filters the list, so a non-array would throw "not iterable"
+    // and leave the slot undeletable (clearPairing deletes it after its loop).
+    return Array.isArray(parsed) ? parsed : [];
   }
 
   /**
