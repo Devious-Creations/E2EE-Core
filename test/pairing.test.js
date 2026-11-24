@@ -598,3 +598,21 @@ test('transport.onError fails an in-flight handshake immediately', async () => {
   fireError('channel died');
   await rejected;
 });
+
+// A stored pairing list that is valid JSON but not an array (`{"a":1}`,
+// `null`, a number, a string) must read as empty, like unparseable JSON
+// already does, so every reader and mutator fails closed instead of throwing
+// "not iterable", and `clearPairing` can still delete the slot.
+for (const stored of ['{"a":1}', 'null', '42', '"x"']) {
+  test(`a non-array stored pairing list (${stored}) reads as empty and clears`, async () => {
+    const keyStore = createMemoryKeyStore();
+    const p = createPairing({ keyStore, transport: createMemoryTransportPair()[0] });
+    await keyStore.setItem('relay_pairings', stored);
+
+    assert.deepEqual(await p.getStoredPairings(), []);
+    await p.removePairing('missing-id');
+    await keyStore.setItem('relay_pairings', stored);
+    await p.clearPairing();
+    assert.equal(await keyStore.getItem('relay_pairings'), null);
+  });
+}

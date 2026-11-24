@@ -451,7 +451,10 @@ Pairing state persists through the injected `KeyStore`
 `{ id, partnerId, channelName, dynamicId?, nickname? }`), `pairing_key_<id>`
 (base64 `K_pair` per pairing), `relay_active_partner`, and three legacy
 single-partner slots migrated once on first read
-(`migrateLegacyPairing`, `src/pairing.js:928-956`). **Trust is committed at
+(`migrateLegacyPairing`, `src/pairing.js:928-956`). A stored list that is
+not valid JSON, or is valid JSON but not an array, reads as empty
+(`readPairingsUnlocked`), so every reader and mutator fails closed and
+`clearPairing` can still delete the slot. **Trust is committed at
 `storePairing`, not at handshake success** — `performHandshake` resolving
 only means keys are exchanged and confirmed; the caller must still show the
 SAS for explicit human comparison and only then call `storePairing`
